@@ -779,6 +779,37 @@ class RPairPropertyAdapter(BaseRFMAdapter):
         return out
 
 
+class StructuredSuirenProjection(nn.Module):
+    """Project [h_R, h_P, Delta_h, abs_Delta_h] blocks separately, then sum."""
+
+    block_names = ("h_R", "h_P", "Delta_h", "abs_Delta_h")
+
+    def __init__(self, input_dim: int, hidden_dim: int):
+        super().__init__()
+        if input_dim <= 0 or input_dim % len(self.block_names) != 0:
+            raise ValueError(f"structured Suiren projection expects 4 equal blocks, got dim={input_dim}")
+        self.input_dim = int(input_dim)
+        self.block_dim = self.input_dim // len(self.block_names)
+        self.blocks = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.LayerNorm(self.block_dim),
+                    nn.Linear(self.block_dim, hidden_dim),
+                    nn.SiLU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                )
+                for _ in self.block_names
+            ]
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if features.shape[-1] != self.input_dim:
+            raise ValueError(f"structured Suiren projection expected last dim {self.input_dim}, got {features.shape[-1]}")
+        chunks = features.split(self.block_dim, dim=-1)
+        projected = torch.stack([projection(chunk) for projection, chunk in zip(self.blocks, chunks, strict=True)], dim=0)
+        return projected.sum(dim=0)
+
+
 class UnifiedReactionInputAdapter(BaseRFMAdapter):
     """Unified Reaction Encoder input adapter for raw R/P inputs plus Suiren features.
 
@@ -818,14 +849,14 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
         )
         self.suiren_atom_projection = nn.ModuleDict(
             {
-                name: nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+                name: StructuredSuirenProjection(dim, hidden_dim)
                 for name, dim in sorted(self.suiren_atom_dims.items())
                 if dim > 0
             }
         )
         self.suiren_graph_projection = nn.ModuleDict(
             {
-                name: nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+                name: StructuredSuirenProjection(dim, hidden_dim)
                 for name, dim in sorted(self.suiren_graph_dims.items())
                 if dim > 0
             }
@@ -902,6 +933,8 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
                 "suiren_atom_dims": self.suiren_atom_dims,
                 "suiren_graph_dims": self.suiren_graph_dims,
                 "suiren_pair_tokens": False,
+                "suiren_projection": "structured_4block_sum",
+                "suiren_projection_blocks": StructuredSuirenProjection.block_names,
             },
         )
         out.validate()
