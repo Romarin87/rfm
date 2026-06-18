@@ -823,12 +823,18 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
                 if dim > 0
             }
         )
+        self.suiren_atom_gate_logits = nn.ParameterDict(
+            {name: nn.Parameter(torch.zeros(())) for name in self.suiren_atom_projection}
+        )
         self.suiren_graph_projection = nn.ModuleDict(
             {
                 name: nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
                 for name, dim in sorted(self.suiren_graph_dims.items())
                 if dim > 0
             }
+        )
+        self.suiren_graph_gate_logits = nn.ParameterDict(
+            {name: nn.Parameter(torch.zeros(())) for name in self.suiren_graph_projection}
         )
 
     @staticmethod
@@ -860,7 +866,8 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
             atom_features = batch[key]
             if atom_features.shape[:2] != (batch_size, n_atoms):
                 raise ValueError(f"suiren_atom_features must be [B,N,C], got {tuple(atom_features.shape)}")
-            atom_tokens = atom_tokens + projection(atom_features)
+            gate = 2.0 * torch.sigmoid(self.suiren_atom_gate_logits[stream])
+            atom_tokens = atom_tokens + gate * projection(atom_features)
         atom_tokens = atom_tokens * atom_valid.unsqueeze(-1)
 
         spec = self.featurizer.spec
@@ -886,7 +893,8 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
             graph_features = batch[key]
             if graph_features.shape[0] != batch_size:
                 raise ValueError(f"suiren_graph_features must be [B,C], got {tuple(graph_features.shape)}")
-            reaction_token = reaction_token + projection(graph_features)
+            gate = 2.0 * torch.sigmoid(self.suiren_graph_gate_logits[stream])
+            reaction_token = reaction_token + gate * projection(graph_features)
 
         out = RFMEncoderInput(
             atom_tokens,
@@ -902,6 +910,9 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
                 "suiren_atom_dims": self.suiren_atom_dims,
                 "suiren_graph_dims": self.suiren_graph_dims,
                 "suiren_pair_tokens": False,
+                "suiren_gate": "2*sigmoid(logit)_scalar_per_stream_level",
+                "suiren_gate_logit_init": 0.0,
+                "suiren_gate_init": 1.0,
             },
         )
         out.validate()
