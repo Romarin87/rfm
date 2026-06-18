@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rfm-reaction-qm"
+version = "0.1.0"
+description = "Structured RFM / Reaction-QM restart pipeline"
+requires-python = ">=3.10"
+dependencies = [
+  "h5py",
+  "numpy",
+  "torch",
+]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rfm*"]

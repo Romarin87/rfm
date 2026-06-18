@@ -1,0 +1,55 @@
+# OS/editor
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Python/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+.env
+.env.*
+.conda/
+.cache/
+.hf_cache/
+
+# Data and generated artifacts
+/data/
+/outputs/
+/reports/
+/runs/
+/logs/
+/features/
+/archive/
+
+# Large binary artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.h5
+*.hdf5
+*.npz
+*.npy
+*.pkl
+*.pickle
+*.parquet
+*.arrow
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Runtime scratch
+*.log
+*.tmp
+*.bak
