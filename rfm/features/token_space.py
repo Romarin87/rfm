@@ -740,6 +740,11 @@ class RPairPropertyAdapter(BaseRFMAdapter):
         self.has_p_3d = has_p_3d or self.featurizer.spec.has_p_3d
         self.z_embedding = nn.Embedding(max_z + 1, hidden_dim)
         self.pair_projection = nn.Sequential(nn.LayerNorm(self.featurizer.output_dim), nn.Linear(self.featurizer.output_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+        self.directional_3d_projection = (
+            nn.Sequential(nn.LayerNorm(4), nn.Linear(4, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+            if self.featurizer.spec.has_r_3d and self.featurizer.spec.has_p_3d
+            else None
+        )
 
     def forward(self, batch: dict[str, torch.Tensor]) -> RFMEncoderInput:
         z = batch["z"].clamp(0, self.z_embedding.num_embeddings - 1)
@@ -753,6 +758,8 @@ class RPairPropertyAdapter(BaseRFMAdapter):
         atom_tokens = atom_tokens * atom_valid.unsqueeze(-1)
         pair_basis = self.featurizer(pair_raw)
         pair_tokens = self.pair_projection(pair_basis) * pair_valid.unsqueeze(-1)
+        if self.directional_3d_projection is not None:
+            pair_tokens = pair_tokens + self.directional_3d_projection(pair_basis[..., -4:]) * pair_valid.unsqueeze(-1)
         spec = self.featurizer.spec
         modality = self.modality_dict(
             z.shape[0],
@@ -816,6 +823,11 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.directional_3d_projection = (
+            nn.Sequential(nn.LayerNorm(4), nn.Linear(4, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+            if self.featurizer.spec.has_r_3d and self.featurizer.spec.has_p_3d
+            else None
+        )
         self.suiren_atom_projection = nn.ModuleDict(
             {
                 name: nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
@@ -849,6 +861,8 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
         pair_raw = batch["pair_input"] if "pair_input" in batch else batch["pair_feats"]
         pair_basis = self.featurizer(pair_raw)
         pair_tokens = self.pair_projection(pair_basis) * pair_valid.unsqueeze(-1)
+        if self.directional_3d_projection is not None:
+            pair_tokens = pair_tokens + self.directional_3d_projection(pair_basis[..., -4:]) * pair_valid.unsqueeze(-1)
 
         atom_tokens = self.z_embedding(z)
         has_atom = False
@@ -902,6 +916,7 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
                 "suiren_atom_dims": self.suiren_atom_dims,
                 "suiren_graph_dims": self.suiren_graph_dims,
                 "suiren_pair_tokens": False,
+                "directional_3d_adapter": self.directional_3d_projection is not None,
             },
         )
         out.validate()
