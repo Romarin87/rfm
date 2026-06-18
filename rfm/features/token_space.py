@@ -560,6 +560,14 @@ class TokenPairMessageLayer(nn.Module):
 
     def __init__(self, hidden_dim: int, dropout: float):
         super().__init__()
+        self.pair_update = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 3),
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.pair_norm = nn.LayerNorm(hidden_dim)
         self.message = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim),
             nn.SiLU(),
@@ -581,16 +589,19 @@ class TokenPairMessageLayer(nn.Module):
         pair_h: torch.Tensor,
         atom_valid_mask: torch.Tensor,
         pair_valid_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch, n_atoms, hidden = atom_h.shape
         h_i = atom_h.unsqueeze(2).expand(batch, n_atoms, n_atoms, hidden)
         h_j = atom_h.unsqueeze(1).expand(batch, n_atoms, n_atoms, hidden)
+        pair_repr = torch.cat([h_i, h_j, pair_h], dim=-1)
+        pair_h = self.pair_norm(pair_h + self.pair_update(pair_repr))
+        pair_h = pair_h * pair_valid_mask.unsqueeze(-1)
         msg = self.message(torch.cat([h_i, h_j, pair_h], dim=-1))
         msg = msg * pair_valid_mask.unsqueeze(-1)
         denom = pair_valid_mask.sum(dim=2).clamp_min(1).float().unsqueeze(-1)
         agg = msg.sum(dim=2) / denom
         atom_h = self.norm(atom_h + self.update(torch.cat([atom_h, agg], dim=-1)))
-        return atom_h * atom_valid_mask.unsqueeze(-1)
+        return atom_h * atom_valid_mask.unsqueeze(-1), pair_h
 
 
 class TokenSpaceReactionEncoder(nn.Module):
@@ -613,7 +624,7 @@ class TokenSpaceReactionEncoder(nn.Module):
         atom_h = encoder_input.atom_tokens * encoder_input.atom_valid_mask.unsqueeze(-1)
         pair_h = encoder_input.pair_tokens * encoder_input.pair_valid_mask.unsqueeze(-1)
         for layer in self.layers:
-            atom_h = layer(atom_h, pair_h, encoder_input.atom_valid_mask, encoder_input.pair_valid_mask)
+            atom_h, pair_h = layer(atom_h, pair_h, encoder_input.atom_valid_mask, encoder_input.pair_valid_mask)
         denom = encoder_input.atom_valid_mask.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
         pooled = (atom_h * encoder_input.atom_valid_mask.unsqueeze(-1)).sum(dim=1) / denom
         reaction_h = self.reaction_norm(
