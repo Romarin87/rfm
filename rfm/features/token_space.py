@@ -566,6 +566,12 @@ class TokenPairMessageLayer(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.pair_attention = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
         self.update = nn.Sequential(
             nn.LayerNorm(hidden_dim * 2),
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -587,8 +593,11 @@ class TokenPairMessageLayer(nn.Module):
         h_j = atom_h.unsqueeze(1).expand(batch, n_atoms, n_atoms, hidden)
         msg = self.message(torch.cat([h_i, h_j, pair_h], dim=-1))
         msg = msg * pair_valid_mask.unsqueeze(-1)
-        denom = pair_valid_mask.sum(dim=2).clamp_min(1).float().unsqueeze(-1)
-        agg = msg.sum(dim=2) / denom
+        attn_logits = self.pair_attention(pair_h).squeeze(-1)
+        attn_logits = attn_logits.masked_fill(~pair_valid_mask, torch.finfo(attn_logits.dtype).min)
+        attn = torch.softmax(attn_logits, dim=2) * pair_valid_mask.float()
+        attn = attn / attn.sum(dim=2, keepdim=True).clamp_min(1e-6)
+        agg = (attn.unsqueeze(-1) * msg).sum(dim=2)
         atom_h = self.norm(atom_h + self.update(torch.cat([atom_h, agg], dim=-1)))
         return atom_h * atom_valid_mask.unsqueeze(-1)
 
