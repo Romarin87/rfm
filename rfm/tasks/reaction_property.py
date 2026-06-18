@@ -178,12 +178,46 @@ def compute_loss(
     stage_a_loss, stage_a_parts = masked_edit.compute_loss(masked_out_view(out), masked_batch_view(batch), args, edit_class_weights(args, batch["y"].device))
     stage_a_weight = float(getattr(args, "stage_a_weight", 0.5))
     prop_weight = property_loss_weight(args)
-    loss = stage_a_weight * stage_a_loss + prop_weight * property_loss
+    consistency_loss = forward_reverse_consistency_loss(out["y"], batch.get("reaction_id", []), y_mean, y_std)
+    consistency_weight = float(getattr(args, "forward_reverse_consistency_weight", 0.0))
+    loss = stage_a_weight * stage_a_loss + prop_weight * property_loss + consistency_weight * consistency_loss
     return loss, {
         "property_loss": float(property_loss.detach().cpu()),
         "stage_a_loss": float(stage_a_loss.detach().cpu()),
+        "consistency_loss": float(consistency_loss.detach().cpu()),
         **stage_a_parts,
     }
+
+
+def forward_reverse_consistency_loss(
+    y_pred_norm: torch.Tensor,
+    reaction_ids: list[str],
+    y_mean: torch.Tensor,
+    y_std: torch.Tensor,
+) -> torch.Tensor:
+    if not reaction_ids:
+        return y_pred_norm.new_zeros(())
+    index = {str(reaction_id): idx for idx, reaction_id in enumerate(reaction_ids)}
+    terms: list[torch.Tensor] = []
+    y_pred_raw = y_pred_norm * y_std + y_mean
+    for reaction_id, forward_idx in index.items():
+        if reaction_id.endswith("__reverse"):
+            continue
+        reverse_idx = index.get(f"{reaction_id}__reverse")
+        if reverse_idx is None:
+            continue
+        forward_raw = y_pred_raw[forward_idx]
+        expected_reverse_raw = torch.stack(
+            [
+                -forward_raw[0],
+                forward_raw[1] - forward_raw[0],
+            ]
+        )
+        expected_reverse_norm = (expected_reverse_raw - y_mean) / y_std
+        terms.append(F.mse_loss(y_pred_norm[reverse_idx], expected_reverse_norm))
+    if not terms:
+        return y_pred_norm.new_zeros(())
+    return torch.stack(terms).mean()
 
 
 def train_one_epoch(
@@ -200,6 +234,7 @@ def train_one_epoch(
         "loss": 0.0,
         "property_loss": 0.0,
         "stage_a_loss": 0.0,
+        "consistency_loss": 0.0,
         "delta_bo_loss": 0.0,
         "changed_loss": 0.0,
         "edit_loss": 0.0,
@@ -230,6 +265,7 @@ def evaluate_loss(model: torch.nn.Module, loader: Any, y_mean: torch.Tensor, y_s
         "loss": 0.0,
         "property_loss": 0.0,
         "stage_a_loss": 0.0,
+        "consistency_loss": 0.0,
         "delta_bo_loss": 0.0,
         "changed_loss": 0.0,
         "edit_loss": 0.0,
