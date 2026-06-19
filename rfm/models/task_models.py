@@ -9,6 +9,26 @@ from rfm.data.reaction_samples import EDIT_CLASSES, ENERGY_TARGETS
 from rfm.features.token_space import MaskedEditAdapter, RPairPropertyAdapter, TokenSpaceReactionEncoder, UnifiedReactionInputAdapter
 
 
+class AtomAttentionReadout(nn.Module):
+    """Masked attention pooling over atom states with the reaction token as query."""
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.query = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.key = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.value = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.scale = hidden_dim**-0.5
+
+    def forward(self, atom_h: torch.Tensor, atom_mask: torch.Tensor, reaction_h: torch.Tensor) -> torch.Tensor:
+        query = self.query(reaction_h).unsqueeze(1)
+        key = self.key(atom_h)
+        scores = (query * key).sum(dim=-1) * self.scale
+        scores = scores.masked_fill(~atom_mask.bool(), torch.finfo(scores.dtype).min)
+        weights = torch.softmax(scores, dim=1)
+        value = self.value(atom_h)
+        return (weights.unsqueeze(-1) * value).sum(dim=1)
+
+
 class MaskedEditHeads(nn.Module):
     """Masked Delta_BO, changed pair, edit class, and core atom heads."""
 
@@ -60,21 +80,38 @@ class ReactionPropertyRegressor(nn.Module):
     D_R/D_P for the 3D variant.
     """
 
-    def __init__(self, pair_raw_dim: int, hidden_dim: int, layers: int, dropout: float, input_schema: str):
+    def __init__(
+        self,
+        pair_raw_dim: int,
+        hidden_dim: int,
+        layers: int,
+        dropout: float,
+        input_schema: str,
+        dynamic_pair_update: bool = False,
+        attention_readout: bool = False,
+        directional_3d_adapter: bool = False,
+    ):
         super().__init__()
         masked_schema, masked_pair_raw_dim = _masked_edit_schema_for_property(input_schema)
         self.adapter = RPairPropertyAdapter(
             hidden_dim=hidden_dim,
             pair_input_dim=pair_raw_dim,
             input_schema=input_schema,
+            directional_3d_adapter=directional_3d_adapter,
         )
         self.masked_adapter = MaskedEditAdapter(
             hidden_dim=hidden_dim,
             pair_input_dim=masked_pair_raw_dim,
             input_schema=masked_schema,
         )
-        self.encoder = TokenSpaceReactionEncoder(hidden_dim=hidden_dim, layers=layers, dropout=dropout)
+        self.encoder = TokenSpaceReactionEncoder(
+            hidden_dim=hidden_dim,
+            layers=layers,
+            dropout=dropout,
+            dynamic_pair_update=dynamic_pair_update,
+        )
         self.masked_edit_heads = MaskedEditHeads(hidden_dim)
+        self.atom_readout = AtomAttentionReadout(hidden_dim) if attention_readout else None
         self.reg_head = nn.Sequential(
             nn.LayerNorm(hidden_dim * 2),
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -88,9 +125,12 @@ class ReactionPropertyRegressor(nn.Module):
         encoded = self.encoder(encoder_input)
         atom_h = encoded["atom_h"]
         atom_mask = batch["atom_mask"].bool()
-        masked_h = atom_h.masked_fill(~atom_mask.unsqueeze(-1), 0.0)
-        mean_pool = masked_h.sum(dim=1) / atom_mask.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
-        y = self.reg_head(torch.cat([encoded["reaction_h"], mean_pool], dim=-1))
+        if self.atom_readout is None:
+            masked_h = atom_h.masked_fill(~atom_mask.unsqueeze(-1), 0.0)
+            atom_pool = masked_h.sum(dim=1) / atom_mask.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
+        else:
+            atom_pool = self.atom_readout(atom_h, atom_mask, encoded["reaction_h"])
+        y = self.reg_head(torch.cat([encoded["reaction_h"], atom_pool], dim=-1))
 
         out = {
             "y": y,
@@ -128,6 +168,10 @@ class SuirenFusionPropertyRegressor(nn.Module):
         suiren_graph_dim: int = 0,
         suiren_atom_dims: dict[str, int] | None = None,
         suiren_graph_dims: dict[str, int] | None = None,
+        enable_suiren_input_gates: bool = False,
+        dynamic_pair_update: bool = False,
+        attention_readout: bool = False,
+        directional_3d_adapter: bool = False,
     ):
         super().__init__()
         masked_schema, masked_pair_raw_dim = _masked_edit_schema_for_property(input_schema)
@@ -139,14 +183,22 @@ class SuirenFusionPropertyRegressor(nn.Module):
             suiren_graph_dim=suiren_graph_dim,
             suiren_atom_dims=suiren_atom_dims,
             suiren_graph_dims=suiren_graph_dims,
+            enable_suiren_gates=enable_suiren_input_gates,
+            directional_3d_adapter=directional_3d_adapter,
         )
         self.masked_adapter = MaskedEditAdapter(
             hidden_dim=hidden_dim,
             pair_input_dim=masked_pair_raw_dim,
             input_schema=masked_schema,
         )
-        self.encoder = TokenSpaceReactionEncoder(hidden_dim=hidden_dim, layers=layers, dropout=dropout)
+        self.encoder = TokenSpaceReactionEncoder(
+            hidden_dim=hidden_dim,
+            layers=layers,
+            dropout=dropout,
+            dynamic_pair_update=dynamic_pair_update,
+        )
         self.masked_edit_heads = MaskedEditHeads(hidden_dim)
+        self.atom_readout = AtomAttentionReadout(hidden_dim) if attention_readout else None
         self.reg_head = nn.Sequential(
             nn.LayerNorm(hidden_dim * 2),
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -164,9 +216,12 @@ class SuirenFusionPropertyRegressor(nn.Module):
         encoded = self.encoder(encoder_input)
         atom_h = encoded["atom_h"]
         atom_mask = batch["atom_mask"].bool()
-        masked_h = atom_h.masked_fill(~atom_mask.unsqueeze(-1), 0.0)
-        mean_pool = masked_h.sum(dim=1) / atom_mask.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
-        y = self.reg_head(torch.cat([encoded["reaction_h"], mean_pool], dim=-1))
+        if self.atom_readout is None:
+            masked_h = atom_h.masked_fill(~atom_mask.unsqueeze(-1), 0.0)
+            atom_pool = masked_h.sum(dim=1) / atom_mask.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
+        else:
+            atom_pool = self.atom_readout(atom_h, atom_mask, encoded["reaction_h"])
+        y = self.reg_head(torch.cat([encoded["reaction_h"], atom_pool], dim=-1))
 
         out = {
             "y": y,
@@ -200,6 +255,15 @@ def load_pretrained_encoder(model: nn.Module, path: str, device: torch.device) -
     payload = torch.load(path, map_location=device, weights_only=False)
     state = payload["encoder"] if isinstance(payload, dict) and "encoder" in payload else payload
     missing, unexpected = model.encoder.load_state_dict(state, strict=False)
-    bad_missing = [key for key in missing if not key.startswith("reaction_update") and not key.startswith("reaction_norm")]
+    allowed_missing_prefixes = ("reaction_update", "reaction_norm")
+    allowed_missing_fragments = (".pair_update.", ".pair_norm.")
+    bad_missing = [
+        key
+        for key in missing
+        if not (
+            key.startswith(allowed_missing_prefixes)
+            or (key.startswith("layers.") and any(fragment in key for fragment in allowed_missing_fragments))
+        )
+    ]
     if bad_missing or unexpected:
         raise RuntimeError(f"pretrained encoder load mismatch: missing={bad_missing[:10]} unexpected={unexpected[:10]}")

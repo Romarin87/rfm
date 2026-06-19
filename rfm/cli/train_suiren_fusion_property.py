@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
 from rfm.models import SuirenFusionPropertyRegressor, load_pretrained_encoder
@@ -68,6 +68,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--changed-weight", type=float, default=0.5)
     parser.add_argument("--edit-weight", type=float, default=0.5)
     parser.add_argument("--core-weight", type=float, default=0.2)
+    parser.add_argument("--forward-reverse-consistency-weight", type=float, default=0.0)
+    parser.add_argument("--enable-suiren-input-gates", action="store_true")
+    parser.add_argument("--enable-dynamic-pair-update", action="store_true")
+    parser.add_argument("--enable-attention-readout", action="store_true")
+    parser.add_argument("--enable-directional-3d-adapter", action="store_true")
     parser.add_argument("--edit-class-weights", default="1.0,4.0,4.0,2.0")
     parser.add_argument("--max-train", type=int, default=0)
     parser.add_argument("--max-valid", type=int, default=0)
@@ -99,6 +104,33 @@ def data_loader_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         kwargs["persistent_workers"] = args.persistent_workers
         kwargs["prefetch_factor"] = args.prefetch_factor
     return kwargs
+
+
+class InterleavedForwardReverseSampler(Sampler[int]):
+    """Shuffle adjacent forward/reverse pairs while keeping each pair together."""
+
+    def __init__(self, dataset_size: int, seed: int):
+        self.dataset_size = int(dataset_size)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        pair_starts = list(range(0, self.dataset_size - 1, 2))
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        order = torch.randperm(len(pair_starts), generator=generator).tolist()
+        for pair_idx in order:
+            start = pair_starts[pair_idx]
+            yield start
+            yield start + 1
+        if self.dataset_size % 2:
+            yield self.dataset_size - 1
+
+    def __len__(self) -> int:
+        return self.dataset_size
 
 
 def reaction_property_schema(args: argparse.Namespace) -> tuple[str, int]:
@@ -181,7 +213,12 @@ def main(argv: list[str] | None = None) -> None:
     if train_ds.suiren_atom_dims != valid_ds.suiren_atom_dims or train_ds.suiren_atom_dims != test_ds.suiren_atom_dims:
         raise ValueError("Suiren atom feature dimensions differ across splits")
 
-    train_sampler = DistributedSampler(train_ds, shuffle=True, seed=args.seed) if ddp_enabled() else None
+    if ddp_enabled():
+        train_sampler = DistributedSampler(train_ds, shuffle=True, seed=args.seed)
+    elif args.forward_reverse_consistency_weight > 0.0:
+        train_sampler = InterleavedForwardReverseSampler(len(train_ds), args.seed)
+    else:
+        train_sampler = None
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -217,6 +254,10 @@ def main(argv: list[str] | None = None) -> None:
         input_schema=input_schema,
         suiren_atom_dims=train_ds.suiren_atom_dims,
         suiren_graph_dims=train_ds.suiren_graph_dims,
+        enable_suiren_input_gates=args.enable_suiren_input_gates,
+        dynamic_pair_update=args.enable_dynamic_pair_update,
+        attention_readout=args.enable_attention_readout,
+        directional_3d_adapter=args.enable_directional_3d_adapter,
     ).to(device)
     if args.pretrained_encoder:
         load_pretrained_encoder(model, args.pretrained_encoder, device)
@@ -292,6 +333,13 @@ def main(argv: list[str] | None = None) -> None:
             "early_stopped": early_stopped,
             "early_stop_patience": args.early_stop_patience,
             "early_stop_min_delta": args.early_stop_min_delta,
+            "model_improvement_switches": {
+                "suiren_input_gates": args.enable_suiren_input_gates,
+                "dynamic_pair_update": args.enable_dynamic_pair_update,
+                "attention_readout": args.enable_attention_readout,
+                "directional_3d_adapter": args.enable_directional_3d_adapter,
+                "forward_reverse_consistency_weight": args.forward_reverse_consistency_weight,
+            },
             "selection": {"criterion": "valid_loss", "best_valid_loss": best_valid_loss, "best_valid_loss_parts": best_valid_loss_parts},
             "valid": valid_metrics,
             "test": test_metrics,
@@ -329,6 +377,7 @@ def main(argv: list[str] | None = None) -> None:
                     "stage_a_weight": args.stage_a_weight,
                     "stage_c_weight": args.stage_c_weight,
                     "effective_property_weight": args.stage_c_weight,
+                    "forward_reverse_consistency_weight": args.forward_reverse_consistency_weight,
                     "stage_a_components": {
                         "delta_bo_weight": args.delta_bo_weight,
                         "changed_weight": args.changed_weight,
@@ -350,6 +399,12 @@ def main(argv: list[str] | None = None) -> None:
                     "persistent_workers": args.persistent_workers if args.num_workers > 0 else False,
                     "prefetch_factor": args.prefetch_factor if args.num_workers > 0 else None,
                 },
+                "model_improvement_switches": {
+                    "suiren_input_gates": args.enable_suiren_input_gates,
+                    "dynamic_pair_update": args.enable_dynamic_pair_update,
+                    "attention_readout": args.enable_attention_readout,
+                    "directional_3d_adapter": args.enable_directional_3d_adapter,
+                },
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -364,7 +419,13 @@ def main(argv: list[str] | None = None) -> None:
             task="suiren_fusion_property_regression",
             model="SuirenFusionPropertyRegressor",
             status="complete",
-            notes=f"input_schema={input_schema}; geometry_mode={args.geometry_mode}; suiren=unified_input; loss=0.5*L_A+1.0*L_C; selection=minimum valid_loss; optimizer={args.optimizer}; suiren_dims={cache_info['dims']}",
+            notes=(
+                f"input_schema={input_schema}; geometry_mode={args.geometry_mode}; suiren=unified_input; "
+                f"loss=0.5*L_A+1.0*L_C+{args.forward_reverse_consistency_weight}*L_FR; "
+                f"selection=minimum valid_loss; optimizer={args.optimizer}; suiren_dims={cache_info['dims']}; "
+                f"switches=gates:{args.enable_suiren_input_gates},dynamic_pair:{args.enable_dynamic_pair_update},"
+                f"attention_readout:{args.enable_attention_readout},directional_3d:{args.enable_directional_3d_adapter}"
+            ),
         )
         print(json.dumps(best, indent=2, ensure_ascii=False), flush=True)
     cleanup_ddp()

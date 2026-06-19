@@ -558,8 +558,18 @@ def batch_bool(batch_size: int, value: bool, device: torch.device) -> torch.Tens
 class TokenPairMessageLayer(nn.Module):
     """Message-passing layer over canonical atom/pair tokens."""
 
-    def __init__(self, hidden_dim: int, dropout: float):
+    def __init__(self, hidden_dim: int, dropout: float, dynamic_pair_update: bool = False):
         super().__init__()
+        self.dynamic_pair_update = bool(dynamic_pair_update)
+        if self.dynamic_pair_update:
+            self.pair_update = nn.Sequential(
+                nn.LayerNorm(hidden_dim * 3),
+                nn.Linear(hidden_dim * 3, hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.pair_norm = nn.LayerNorm(hidden_dim)
         self.message = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim),
             nn.SiLU(),
@@ -581,24 +591,30 @@ class TokenPairMessageLayer(nn.Module):
         pair_h: torch.Tensor,
         atom_valid_mask: torch.Tensor,
         pair_valid_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch, n_atoms, hidden = atom_h.shape
         h_i = atom_h.unsqueeze(2).expand(batch, n_atoms, n_atoms, hidden)
         h_j = atom_h.unsqueeze(1).expand(batch, n_atoms, n_atoms, hidden)
+        if self.dynamic_pair_update:
+            pair_repr = torch.cat([h_i, h_j, pair_h], dim=-1)
+            pair_h = self.pair_norm(pair_h + self.pair_update(pair_repr))
+            pair_h = pair_h * pair_valid_mask.unsqueeze(-1)
         msg = self.message(torch.cat([h_i, h_j, pair_h], dim=-1))
         msg = msg * pair_valid_mask.unsqueeze(-1)
         denom = pair_valid_mask.sum(dim=2).clamp_min(1).float().unsqueeze(-1)
         agg = msg.sum(dim=2) / denom
         atom_h = self.norm(atom_h + self.update(torch.cat([atom_h, agg], dim=-1)))
-        return atom_h * atom_valid_mask.unsqueeze(-1)
+        return atom_h * atom_valid_mask.unsqueeze(-1), pair_h
 
 
 class TokenSpaceReactionEncoder(nn.Module):
     """Shared trunk that consumes `RFMEncoderInput`, independent of raw modality."""
 
-    def __init__(self, hidden_dim: int, layers: int, dropout: float):
+    def __init__(self, hidden_dim: int, layers: int, dropout: float, dynamic_pair_update: bool = False):
         super().__init__()
-        self.layers = nn.ModuleList([TokenPairMessageLayer(hidden_dim, dropout) for _ in range(layers)])
+        self.layers = nn.ModuleList(
+            [TokenPairMessageLayer(hidden_dim, dropout, dynamic_pair_update=dynamic_pair_update) for _ in range(layers)]
+        )
         self.reaction_update = nn.Sequential(
             nn.LayerNorm(hidden_dim * 2),
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -613,7 +629,7 @@ class TokenSpaceReactionEncoder(nn.Module):
         atom_h = encoder_input.atom_tokens * encoder_input.atom_valid_mask.unsqueeze(-1)
         pair_h = encoder_input.pair_tokens * encoder_input.pair_valid_mask.unsqueeze(-1)
         for layer in self.layers:
-            atom_h = layer(atom_h, pair_h, encoder_input.atom_valid_mask, encoder_input.pair_valid_mask)
+            atom_h, pair_h = layer(atom_h, pair_h, encoder_input.atom_valid_mask, encoder_input.pair_valid_mask)
         denom = encoder_input.atom_valid_mask.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
         pooled = (atom_h * encoder_input.atom_valid_mask.unsqueeze(-1)).sum(dim=1) / denom
         reaction_h = self.reaction_norm(
@@ -732,6 +748,7 @@ class RPairPropertyAdapter(BaseRFMAdapter):
         has_p_3d: bool = False,
         input_schema: str | None = None,
         distance_clip: float = 10.0,
+        directional_3d_adapter: bool = False,
     ):
         super().__init__(hidden_dim, task_name="property")
         schema = input_schema or infer_pair_basis_schema(pair_input_dim, self.task_name)
@@ -740,6 +757,11 @@ class RPairPropertyAdapter(BaseRFMAdapter):
         self.has_p_3d = has_p_3d or self.featurizer.spec.has_p_3d
         self.z_embedding = nn.Embedding(max_z + 1, hidden_dim)
         self.pair_projection = nn.Sequential(nn.LayerNorm(self.featurizer.output_dim), nn.Linear(self.featurizer.output_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+        self.directional_3d_projection = (
+            nn.Sequential(nn.LayerNorm(4), nn.Linear(4, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+            if directional_3d_adapter and self.featurizer.spec.has_r_3d and self.featurizer.spec.has_p_3d
+            else None
+        )
 
     def forward(self, batch: dict[str, torch.Tensor]) -> RFMEncoderInput:
         z = batch["z"].clamp(0, self.z_embedding.num_embeddings - 1)
@@ -753,6 +775,8 @@ class RPairPropertyAdapter(BaseRFMAdapter):
         atom_tokens = atom_tokens * atom_valid.unsqueeze(-1)
         pair_basis = self.featurizer(pair_raw)
         pair_tokens = self.pair_projection(pair_basis) * pair_valid.unsqueeze(-1)
+        if self.directional_3d_projection is not None:
+            pair_tokens = pair_tokens + self.directional_3d_projection(pair_basis[..., -4:]) * pair_valid.unsqueeze(-1)
         spec = self.featurizer.spec
         modality = self.modality_dict(
             z.shape[0],
@@ -799,9 +823,12 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
         suiren_graph_dims: dict[str, int] | None = None,
         max_z: int = 36,
         distance_clip: float = 10.0,
+        enable_suiren_gates: bool = False,
+        directional_3d_adapter: bool = False,
     ):
         super().__init__(hidden_dim, task_name="suiren_fusion_property")
         self.featurizer = ReactionInputFeaturizer(input_schema, distance_clip=distance_clip)
+        self.enable_suiren_gates = bool(enable_suiren_gates)
         self.suiren_atom_dims = dict(suiren_atom_dims or {})
         self.suiren_graph_dims = dict(suiren_graph_dims or {})
         if suiren_atom_dim > 0 and not self.suiren_atom_dims:
@@ -816,6 +843,11 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.directional_3d_projection = (
+            nn.Sequential(nn.LayerNorm(4), nn.Linear(4, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+            if directional_3d_adapter and self.featurizer.spec.has_r_3d and self.featurizer.spec.has_p_3d
+            else None
+        )
         self.suiren_atom_projection = nn.ModuleDict(
             {
                 name: nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
@@ -823,12 +855,18 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
                 if dim > 0
             }
         )
+        self.suiren_atom_gate_logits = nn.ParameterDict(
+            {name: nn.Parameter(torch.zeros(())) for name in self.suiren_atom_projection}
+        )
         self.suiren_graph_projection = nn.ModuleDict(
             {
                 name: nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
                 for name, dim in sorted(self.suiren_graph_dims.items())
                 if dim > 0
             }
+        )
+        self.suiren_graph_gate_logits = nn.ParameterDict(
+            {name: nn.Parameter(torch.zeros(())) for name in self.suiren_graph_projection}
         )
 
     @staticmethod
@@ -849,6 +887,8 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
         pair_raw = batch["pair_input"] if "pair_input" in batch else batch["pair_feats"]
         pair_basis = self.featurizer(pair_raw)
         pair_tokens = self.pair_projection(pair_basis) * pair_valid.unsqueeze(-1)
+        if self.directional_3d_projection is not None:
+            pair_tokens = pair_tokens + self.directional_3d_projection(pair_basis[..., -4:]) * pair_valid.unsqueeze(-1)
 
         atom_tokens = self.z_embedding(z)
         has_atom = False
@@ -860,7 +900,10 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
             atom_features = batch[key]
             if atom_features.shape[:2] != (batch_size, n_atoms):
                 raise ValueError(f"suiren_atom_features must be [B,N,C], got {tuple(atom_features.shape)}")
-            atom_tokens = atom_tokens + projection(atom_features)
+            projected = projection(atom_features)
+            if self.enable_suiren_gates:
+                projected = projected * (2.0 * torch.sigmoid(self.suiren_atom_gate_logits[stream]))
+            atom_tokens = atom_tokens + projected
         atom_tokens = atom_tokens * atom_valid.unsqueeze(-1)
 
         spec = self.featurizer.spec
@@ -886,7 +929,10 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
             graph_features = batch[key]
             if graph_features.shape[0] != batch_size:
                 raise ValueError(f"suiren_graph_features must be [B,C], got {tuple(graph_features.shape)}")
-            reaction_token = reaction_token + projection(graph_features)
+            projected = projection(graph_features)
+            if self.enable_suiren_gates:
+                projected = projected * (2.0 * torch.sigmoid(self.suiren_graph_gate_logits[stream]))
+            reaction_token = reaction_token + projected
 
         out = RFMEncoderInput(
             atom_tokens,
@@ -902,6 +948,8 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
                 "suiren_atom_dims": self.suiren_atom_dims,
                 "suiren_graph_dims": self.suiren_graph_dims,
                 "suiren_pair_tokens": False,
+                "suiren_input_gates": self.enable_suiren_gates,
+                "directional_3d_adapter": self.directional_3d_projection is not None,
             },
         )
         out.validate()
