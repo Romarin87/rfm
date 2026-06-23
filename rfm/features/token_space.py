@@ -607,18 +607,32 @@ class TokenSpaceReactionEncoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.reaction_norm = nn.LayerNorm(hidden_dim)
+        self.atom_global_update = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.atom_global_norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, encoder_input: RFMEncoderInput) -> dict[str, torch.Tensor]:
         encoder_input.validate()
         atom_h = encoder_input.atom_tokens * encoder_input.atom_valid_mask.unsqueeze(-1)
         pair_h = encoder_input.pair_tokens * encoder_input.pair_valid_mask.unsqueeze(-1)
+        reaction_h = encoder_input.reaction_token
         for layer in self.layers:
             atom_h = layer(atom_h, pair_h, encoder_input.atom_valid_mask, encoder_input.pair_valid_mask)
-        denom = encoder_input.atom_valid_mask.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
-        pooled = (atom_h * encoder_input.atom_valid_mask.unsqueeze(-1)).sum(dim=1) / denom
-        reaction_h = self.reaction_norm(
-            encoder_input.reaction_token + self.reaction_update(torch.cat([encoder_input.reaction_token, pooled], dim=-1))
-        )
+            denom = encoder_input.atom_valid_mask.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
+            pooled = (atom_h * encoder_input.atom_valid_mask.unsqueeze(-1)).sum(dim=1) / denom
+            reaction_h = self.reaction_norm(
+                reaction_h + self.reaction_update(torch.cat([reaction_h, pooled], dim=-1))
+            )
+            reaction_context = reaction_h.unsqueeze(1).expand_as(atom_h)
+            atom_h = self.atom_global_norm(
+                atom_h + self.atom_global_update(torch.cat([atom_h, reaction_context], dim=-1))
+            )
+            atom_h = atom_h * encoder_input.atom_valid_mask.unsqueeze(-1)
         return {"atom_h": atom_h, "pair_h": pair_h, "reaction_h": reaction_h}
 
 
