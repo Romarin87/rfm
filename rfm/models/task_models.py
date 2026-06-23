@@ -200,6 +200,12 @@ def load_pretrained_encoder(model: nn.Module, path: str, device: torch.device) -
     payload = torch.load(path, map_location=device, weights_only=False)
     state = payload["encoder"] if isinstance(payload, dict) and "encoder" in payload else payload
     missing, unexpected = model.encoder.load_state_dict(state, strict=False)
-    bad_missing = [key for key in missing if not key.startswith("reaction_update") and not key.startswith("reaction_norm")]
+    bad_missing = [
+        key
+        for key in missing
+        if not key.startswith("reaction_update")
+        and not key.startswith("reaction_norm")
+        and not (key.startswith("layers.") and ".attention." in key)
+    ]
     if bad_missing or unexpected:
         raise RuntimeError(f"pretrained encoder load mismatch: missing={bad_missing[:10]} unexpected={unexpected[:10]}")
