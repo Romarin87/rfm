@@ -9,6 +9,26 @@ from rfm.data.reaction_samples import EDIT_CLASSES, ENERGY_TARGETS
 from rfm.features.token_space import MaskedEditAdapter, RPairPropertyAdapter, TokenSpaceReactionEncoder, UnifiedReactionInputAdapter
 
 
+class AtomAttentionReadout(nn.Module):
+    """Masked atom attention pooling using the reaction representation as query."""
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.query = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.key = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.value = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.scale = hidden_dim**-0.5
+
+    def forward(self, atom_h: torch.Tensor, atom_mask: torch.Tensor, reaction_h: torch.Tensor) -> torch.Tensor:
+        query = self.query(reaction_h).unsqueeze(1)
+        key = self.key(atom_h)
+        scores = (query * key).sum(dim=-1) * self.scale
+        scores = scores.masked_fill(~atom_mask.bool(), torch.finfo(scores.dtype).min)
+        weights = torch.softmax(scores, dim=1)
+        value = self.value(atom_h)
+        return (weights.unsqueeze(-1) * value).sum(dim=1)
+
+
 class MaskedEditHeads(nn.Module):
     """Masked Delta_BO, changed pair, edit class, and core atom heads."""
 
@@ -75,6 +95,7 @@ class ReactionPropertyRegressor(nn.Module):
         )
         self.encoder = TokenSpaceReactionEncoder(hidden_dim=hidden_dim, layers=layers, dropout=dropout)
         self.masked_edit_heads = MaskedEditHeads(hidden_dim)
+        self.atom_readout = AtomAttentionReadout(hidden_dim)
         self.reg_head = nn.Sequential(
             nn.LayerNorm(hidden_dim * 2),
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -88,8 +109,7 @@ class ReactionPropertyRegressor(nn.Module):
         encoded = self.encoder(encoder_input)
         atom_h = encoded["atom_h"]
         atom_mask = batch["atom_mask"].bool()
-        masked_h = atom_h.masked_fill(~atom_mask.unsqueeze(-1), 0.0)
-        mean_pool = masked_h.sum(dim=1) / atom_mask.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
+        mean_pool = self.atom_readout(atom_h, atom_mask, encoded["reaction_h"])
         y = self.reg_head(torch.cat([encoded["reaction_h"], mean_pool], dim=-1))
 
         out = {
@@ -147,6 +167,7 @@ class SuirenFusionPropertyRegressor(nn.Module):
         )
         self.encoder = TokenSpaceReactionEncoder(hidden_dim=hidden_dim, layers=layers, dropout=dropout)
         self.masked_edit_heads = MaskedEditHeads(hidden_dim)
+        self.atom_readout = AtomAttentionReadout(hidden_dim)
         self.reg_head = nn.Sequential(
             nn.LayerNorm(hidden_dim * 2),
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -164,8 +185,7 @@ class SuirenFusionPropertyRegressor(nn.Module):
         encoded = self.encoder(encoder_input)
         atom_h = encoded["atom_h"]
         atom_mask = batch["atom_mask"].bool()
-        masked_h = atom_h.masked_fill(~atom_mask.unsqueeze(-1), 0.0)
-        mean_pool = masked_h.sum(dim=1) / atom_mask.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
+        mean_pool = self.atom_readout(atom_h, atom_mask, encoded["reaction_h"])
         y = self.reg_head(torch.cat([encoded["reaction_h"], mean_pool], dim=-1))
 
         out = {
