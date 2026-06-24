@@ -144,6 +144,7 @@ class SuirenFusionPropertyRegressor(nn.Module):
             hidden_dim=hidden_dim,
             pair_input_dim=masked_pair_raw_dim,
             input_schema=masked_schema,
+            emit_base_channel=True,
         )
         self.encoder = TokenSpaceReactionEncoder(hidden_dim=hidden_dim, layers=layers, dropout=dropout)
         self.masked_edit_heads = MaskedEditHeads(hidden_dim)
@@ -200,6 +201,7 @@ def load_pretrained_encoder(model: nn.Module, path: str, device: torch.device) -
     payload = torch.load(path, map_location=device, weights_only=False)
     state = payload["encoder"] if isinstance(payload, dict) and "encoder" in payload else payload
     missing, unexpected = model.encoder.load_state_dict(state, strict=False)
-    bad_missing = [key for key in missing if not key.startswith("reaction_update") and not key.startswith("reaction_norm")]
+    allowed_missing = ("reaction_update", "reaction_norm", "atom_channel_gate")
+    bad_missing = [key for key in missing if not key.startswith(allowed_missing)]
     if bad_missing or unexpected:
         raise RuntimeError(f"pretrained encoder load mismatch: missing={bad_missing[:10]} unexpected={unexpected[:10]}")

@@ -496,6 +496,8 @@ class RFMEncoderInput:
       atom_valid_mask:  [B, N]
       pair_valid_mask:  [B, N, N]
       modality_mask:    modality name -> [B] bool tensor
+      atom_channel_tokens: optional [B, N, C, H] residual atom channels.
+      atom_channel_mask:   optional [B, C] bool tensor; channel 0 is base.
     """
 
     atom_tokens: torch.Tensor
@@ -506,6 +508,8 @@ class RFMEncoderInput:
     modality_mask: dict[str, torch.Tensor] = field(default_factory=dict)
     task_name: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    atom_channel_tokens: torch.Tensor | None = None
+    atom_channel_mask: torch.Tensor | None = None
 
     def validate(self) -> None:
         if self.atom_tokens.ndim != 3:
@@ -529,6 +533,21 @@ class RFMEncoderInput:
         for name, mask in self.modality_mask.items():
             if mask.shape != (batch,):
                 raise ValueError(f"modality_mask[{name}] must be [B], got {tuple(mask.shape)}")
+        if self.atom_channel_tokens is not None:
+            if self.atom_channel_tokens.ndim != 4:
+                raise ValueError(f"atom_channel_tokens must be [B,N,C,H], got {tuple(self.atom_channel_tokens.shape)}")
+            if self.atom_channel_tokens.shape[:2] != (batch, n_atoms) or self.atom_channel_tokens.shape[-1] != hidden:
+                raise ValueError(
+                    "atom_channel_tokens must match atom_tokens as [B,N,C,H], "
+                    f"got channels={tuple(self.atom_channel_tokens.shape)} atom={tuple(self.atom_tokens.shape)}"
+                )
+            if self.atom_channel_mask is None:
+                raise ValueError("atom_channel_mask is required when atom_channel_tokens is provided")
+            if self.atom_channel_mask.shape != (batch, self.atom_channel_tokens.shape[2]):
+                raise ValueError(
+                    "atom_channel_mask must be [B,C], "
+                    f"got mask={tuple(self.atom_channel_mask.shape)} channels={tuple(self.atom_channel_tokens.shape)}"
+                )
 
     def to(self, device: torch.device | str) -> "RFMEncoderInput":
         return RFMEncoderInput(
@@ -540,6 +559,8 @@ class RFMEncoderInput:
             modality_mask={key: value.to(device) for key, value in self.modality_mask.items()},
             task_name=self.task_name,
             metadata=self.metadata,
+            atom_channel_tokens=self.atom_channel_tokens.to(device) if self.atom_channel_tokens is not None else None,
+            atom_channel_mask=self.atom_channel_mask.to(device) if self.atom_channel_mask is not None else None,
         )
 
 
@@ -599,6 +620,17 @@ class TokenSpaceReactionEncoder(nn.Module):
     def __init__(self, hidden_dim: int, layers: int, dropout: float):
         super().__init__()
         self.layers = nn.ModuleList([TokenPairMessageLayer(hidden_dim, dropout) for _ in range(layers)])
+        self.atom_channel_gate = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        final_gate = self.atom_channel_gate[-1]
+        if isinstance(final_gate, nn.Linear):
+            nn.init.zeros_(final_gate.weight)
+            nn.init.constant_(final_gate.bias, -4.0)
         self.reaction_update = nn.Sequential(
             nn.LayerNorm(hidden_dim * 2),
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -610,16 +642,56 @@ class TokenSpaceReactionEncoder(nn.Module):
 
     def forward(self, encoder_input: RFMEncoderInput) -> dict[str, torch.Tensor]:
         encoder_input.validate()
-        atom_h = encoder_input.atom_tokens * encoder_input.atom_valid_mask.unsqueeze(-1)
         pair_h = encoder_input.pair_tokens * encoder_input.pair_valid_mask.unsqueeze(-1)
-        for layer in self.layers:
-            atom_h = layer(atom_h, pair_h, encoder_input.atom_valid_mask, encoder_input.pair_valid_mask)
+        if encoder_input.atom_channel_tokens is not None:
+            atom_h = self._forward_residual_atom_channels(encoder_input, pair_h)
+        else:
+            atom_h = encoder_input.atom_tokens * encoder_input.atom_valid_mask.unsqueeze(-1)
+            for layer in self.layers:
+                atom_h = layer(atom_h, pair_h, encoder_input.atom_valid_mask, encoder_input.pair_valid_mask)
         denom = encoder_input.atom_valid_mask.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
         pooled = (atom_h * encoder_input.atom_valid_mask.unsqueeze(-1)).sum(dim=1) / denom
         reaction_h = self.reaction_norm(
             encoder_input.reaction_token + self.reaction_update(torch.cat([encoder_input.reaction_token, pooled], dim=-1))
         )
         return {"atom_h": atom_h, "pair_h": pair_h, "reaction_h": reaction_h}
+
+    def _forward_residual_atom_channels(self, encoder_input: RFMEncoderInput, pair_h: torch.Tensor) -> torch.Tensor:
+        atom_channels = encoder_input.atom_channel_tokens
+        channel_mask = encoder_input.atom_channel_mask.bool()
+        assert atom_channels is not None
+        batch, n_atoms, n_channels, hidden = atom_channels.shape
+        if n_channels < 1:
+            raise ValueError("atom_channel_tokens must include at least the base channel")
+
+        atom_channels = atom_channels * encoder_input.atom_valid_mask.unsqueeze(-1).unsqueeze(-1)
+        atom_channels = atom_channels * channel_mask.unsqueeze(1).unsqueeze(-1)
+        flat_pair = pair_h.unsqueeze(1).expand(batch, n_channels, n_atoms, n_atoms, hidden).reshape(batch * n_channels, n_atoms, n_atoms, hidden)
+        flat_atom_mask = encoder_input.atom_valid_mask.unsqueeze(1).expand(batch, n_channels, n_atoms).reshape(batch * n_channels, n_atoms)
+        flat_pair_mask = encoder_input.pair_valid_mask.unsqueeze(1).expand(batch, n_channels, n_atoms, n_atoms).reshape(batch * n_channels, n_atoms, n_atoms)
+        flat_channel_mask = channel_mask.reshape(batch * n_channels)
+        flat_atom_mask = flat_atom_mask & flat_channel_mask.unsqueeze(-1)
+        flat_pair_mask = flat_pair_mask & flat_channel_mask.view(batch * n_channels, 1, 1)
+
+        for layer in self.layers:
+            flat_atom = atom_channels.permute(0, 2, 1, 3).reshape(batch * n_channels, n_atoms, hidden)
+            flat_atom = layer(flat_atom, flat_pair, flat_atom_mask, flat_pair_mask)
+            layer_channels = flat_atom.reshape(batch, n_channels, n_atoms, hidden).permute(0, 2, 1, 3)
+            base_h = layer_channels[:, :, 0, :]
+            if n_channels > 1:
+                aux_h = layer_channels[:, :, 1:, :]
+                aux_mask = channel_mask[:, 1:].unsqueeze(1).unsqueeze(-1)
+                delta = aux_h - base_h.unsqueeze(2)
+                gate_input = torch.cat([base_h.unsqueeze(2).expand_as(aux_h), aux_h], dim=-1)
+                gate = torch.sigmoid(self.atom_channel_gate(gate_input)) * aux_mask
+                fused_base = base_h + (gate * delta).sum(dim=2)
+                atom_channels = torch.cat([fused_base.unsqueeze(2), fused_base.unsqueeze(2) + delta], dim=2)
+            else:
+                atom_channels = base_h.unsqueeze(2)
+            atom_channels = atom_channels * encoder_input.atom_valid_mask.unsqueeze(-1).unsqueeze(-1)
+            atom_channels = atom_channels * channel_mask.unsqueeze(1).unsqueeze(-1)
+
+        return atom_channels[:, :, 0, :] * encoder_input.atom_valid_mask.unsqueeze(-1)
 
 
 class BaseRFMAdapter(nn.Module):
@@ -676,12 +748,14 @@ class MaskedEditAdapter(BaseRFMAdapter):
         max_z: int = 36,
         input_schema: str | None = None,
         distance_clip: float = 10.0,
+        emit_base_channel: bool = False,
     ):
         super().__init__(hidden_dim, task_name="masked_edit")
         schema = input_schema or infer_pair_basis_schema(pair_input_dim, self.task_name)
         self.featurizer = ReactionInputFeaturizer(schema, distance_clip=distance_clip)
         self.z_embedding = nn.Embedding(max_z + 1, hidden_dim)
         self.pair_projection = nn.Sequential(nn.LayerNorm(self.featurizer.output_dim), nn.Linear(self.featurizer.output_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+        self.emit_base_channel = emit_base_channel
 
     def forward(self, batch: dict[str, torch.Tensor]) -> RFMEncoderInput:
         z = batch["z"].clamp(0, self.z_embedding.num_embeddings - 1)
@@ -715,6 +789,8 @@ class MaskedEditAdapter(BaseRFMAdapter):
             modality,
             self.task_name,
             metadata={"pair_basis_schema": self.featurizer.schema, "pair_basis_names": self.featurizer.spec.names},
+            atom_channel_tokens=atom_tokens.unsqueeze(2) if self.emit_base_channel else None,
+            atom_channel_mask=torch.ones(z.shape[0], 1, dtype=torch.bool, device=z.device) if self.emit_base_channel else None,
         )
         out.validate()
         return out
@@ -850,7 +926,11 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
         pair_basis = self.featurizer(pair_raw)
         pair_tokens = self.pair_projection(pair_basis) * pair_valid.unsqueeze(-1)
 
-        atom_tokens = self.z_embedding(z)
+        base_atom_tokens = self.z_embedding(z)
+        atom_tokens = base_atom_tokens
+        atom_channels = [base_atom_tokens * atom_valid.unsqueeze(-1)]
+        channel_masks = [torch.ones(batch_size, dtype=torch.bool, device=z.device)]
+        channel_names = ["base"]
         has_atom = False
         for stream, projection in self.suiren_atom_projection.items():
             key = self.suiren_feature_key(stream, "atom")
@@ -860,8 +940,20 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
             atom_features = batch[key]
             if atom_features.shape[:2] != (batch_size, n_atoms):
                 raise ValueError(f"suiren_atom_features must be [B,N,C], got {tuple(atom_features.shape)}")
-            atom_tokens = atom_tokens + projection(atom_features)
+            projected = projection(atom_features)
+            atom_tokens = atom_tokens + projected
+            stream_channel = (base_atom_tokens + projected) * atom_valid.unsqueeze(-1)
+            failed_key = f"suiren_{stream}_atom_failed"
+            if failed_key in batch:
+                stream_mask = ~batch[failed_key].bool()
+            else:
+                stream_mask = torch.ones(batch_size, dtype=torch.bool, device=z.device)
+            atom_channels.append(stream_channel)
+            channel_masks.append(stream_mask)
+            channel_names.append(stream)
         atom_tokens = atom_tokens * atom_valid.unsqueeze(-1)
+        atom_channel_tokens = torch.stack(atom_channels, dim=2) if has_atom else None
+        atom_channel_mask = torch.stack(channel_masks, dim=1) if has_atom else None
 
         spec = self.featurizer.spec
         has_graph = any(self.suiren_feature_key(stream, "graph") in batch for stream in self.suiren_graph_projection)
@@ -902,7 +994,11 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
                 "suiren_atom_dims": self.suiren_atom_dims,
                 "suiren_graph_dims": self.suiren_graph_dims,
                 "suiren_pair_tokens": False,
+                "suiren_atom_residual_channels": bool(has_atom),
+                "atom_channel_names": channel_names if has_atom else [],
             },
+            atom_channel_tokens=atom_channel_tokens,
+            atom_channel_mask=atom_channel_mask,
         )
         out.validate()
         return out
