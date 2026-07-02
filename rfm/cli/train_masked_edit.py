@@ -51,6 +51,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dynamic-pair-update", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dynamic-pair-update-scale", type=float, default=0.75)
+    parser.add_argument("--dynamic-pair-update-dropout", type=float, default=None)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--geometry-mode", choices=("2d", "irc_rp"), default="2d")
     parser.add_argument("--mask-strategy", choices=("reaction_center", "changed_enriched", "random_pair"), default="reaction_center")
@@ -112,7 +115,16 @@ def main(argv: list[str] | None = None) -> None:
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, collate_fn=masked_edit.collate, num_workers=args.num_workers, pin_memory=torch.cuda.is_available())
 
     input_schema, pair_raw_dim = masked_edit_schema(args)
-    model = MaskedEditPretrainingModel(pair_raw_dim, args.hidden_dim, args.layers, args.dropout, input_schema=input_schema).to(device)
+    model = MaskedEditPretrainingModel(
+        pair_raw_dim,
+        args.hidden_dim,
+        args.layers,
+        args.dropout,
+        input_schema=input_schema,
+        dynamic_pair_update=args.dynamic_pair_update,
+        dynamic_pair_update_scale=args.dynamic_pair_update_scale,
+        dynamic_pair_update_dropout=args.dynamic_pair_update_dropout,
+    ).to(device)
     train_model: nn.Module = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False) if ddp_enabled() and device.type == "cuda" else model
     optimizer = build_optimizer(train_model.named_parameters(), args)
     weight_values = masked_edit.parse_float_list(args.edit_class_weights)

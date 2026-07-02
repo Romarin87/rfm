@@ -56,6 +56,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dynamic-pair-update", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dynamic-pair-update-scale", type=float, default=0.75)
+    parser.add_argument("--dynamic-pair-update-dropout", type=float, default=None)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--geometry-mode", choices=("2d", "irc_rp"), default="2d")
     parser.add_argument("--stage-a-weight", type=float, default=0.5)
@@ -217,6 +220,9 @@ def main(argv: list[str] | None = None) -> None:
         input_schema=input_schema,
         suiren_atom_dims=train_ds.suiren_atom_dims,
         suiren_graph_dims=train_ds.suiren_graph_dims,
+        dynamic_pair_update=args.dynamic_pair_update,
+        dynamic_pair_update_scale=args.dynamic_pair_update_scale,
+        dynamic_pair_update_dropout=args.dynamic_pair_update_dropout,
     ).to(device)
     if args.pretrained_encoder:
         load_pretrained_encoder(model, args.pretrained_encoder, device)

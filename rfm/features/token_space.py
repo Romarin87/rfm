@@ -558,8 +558,27 @@ def batch_bool(batch_size: int, value: bool, device: torch.device) -> torch.Tens
 class TokenPairMessageLayer(nn.Module):
     """Message-passing layer over canonical atom/pair tokens."""
 
-    def __init__(self, hidden_dim: int, dropout: float):
+    def __init__(
+        self,
+        hidden_dim: int,
+        dropout: float,
+        dynamic_pair_update: bool = True,
+        dynamic_pair_update_scale: float = 0.75,
+        dynamic_pair_update_dropout: float | None = None,
+    ):
         super().__init__()
+        self.dynamic_pair_update = bool(dynamic_pair_update)
+        self.dynamic_pair_update_scale = float(dynamic_pair_update_scale)
+        if self.dynamic_pair_update:
+            pair_dropout = dropout if dynamic_pair_update_dropout is None else float(dynamic_pair_update_dropout)
+            self.pair_update = nn.Sequential(
+                nn.LayerNorm(hidden_dim * 3),
+                nn.Linear(hidden_dim * 3, hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(pair_dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.pair_norm = nn.LayerNorm(hidden_dim)
         self.message = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim),
             nn.SiLU(),
@@ -581,24 +600,47 @@ class TokenPairMessageLayer(nn.Module):
         pair_h: torch.Tensor,
         atom_valid_mask: torch.Tensor,
         pair_valid_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch, n_atoms, hidden = atom_h.shape
         h_i = atom_h.unsqueeze(2).expand(batch, n_atoms, n_atoms, hidden)
         h_j = atom_h.unsqueeze(1).expand(batch, n_atoms, n_atoms, hidden)
+        if self.dynamic_pair_update:
+            pair_repr = torch.cat([h_i, h_j, pair_h], dim=-1)
+            pair_h = self.pair_norm(pair_h + self.dynamic_pair_update_scale * self.pair_update(pair_repr))
+            pair_h = pair_h * pair_valid_mask.unsqueeze(-1)
         msg = self.message(torch.cat([h_i, h_j, pair_h], dim=-1))
         msg = msg * pair_valid_mask.unsqueeze(-1)
         denom = pair_valid_mask.sum(dim=2).clamp_min(1).float().unsqueeze(-1)
         agg = msg.sum(dim=2) / denom
         atom_h = self.norm(atom_h + self.update(torch.cat([atom_h, agg], dim=-1)))
-        return atom_h * atom_valid_mask.unsqueeze(-1)
+        return atom_h * atom_valid_mask.unsqueeze(-1), pair_h
 
 
 class TokenSpaceReactionEncoder(nn.Module):
     """Shared trunk that consumes `RFMEncoderInput`, independent of raw modality."""
 
-    def __init__(self, hidden_dim: int, layers: int, dropout: float):
+    def __init__(
+        self,
+        hidden_dim: int,
+        layers: int,
+        dropout: float,
+        dynamic_pair_update: bool = True,
+        dynamic_pair_update_scale: float = 0.75,
+        dynamic_pair_update_dropout: float | None = None,
+    ):
         super().__init__()
-        self.layers = nn.ModuleList([TokenPairMessageLayer(hidden_dim, dropout) for _ in range(layers)])
+        self.layers = nn.ModuleList(
+            [
+                TokenPairMessageLayer(
+                    hidden_dim,
+                    dropout,
+                    dynamic_pair_update=dynamic_pair_update,
+                    dynamic_pair_update_scale=dynamic_pair_update_scale,
+                    dynamic_pair_update_dropout=dynamic_pair_update_dropout,
+                )
+                for _ in range(layers)
+            ]
+        )
         self.reaction_update = nn.Sequential(
             nn.LayerNorm(hidden_dim * 2),
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -613,7 +655,7 @@ class TokenSpaceReactionEncoder(nn.Module):
         atom_h = encoder_input.atom_tokens * encoder_input.atom_valid_mask.unsqueeze(-1)
         pair_h = encoder_input.pair_tokens * encoder_input.pair_valid_mask.unsqueeze(-1)
         for layer in self.layers:
-            atom_h = layer(atom_h, pair_h, encoder_input.atom_valid_mask, encoder_input.pair_valid_mask)
+            atom_h, pair_h = layer(atom_h, pair_h, encoder_input.atom_valid_mask, encoder_input.pair_valid_mask)
         denom = encoder_input.atom_valid_mask.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
         pooled = (atom_h * encoder_input.atom_valid_mask.unsqueeze(-1)).sum(dim=1) / denom
         reaction_h = self.reaction_norm(

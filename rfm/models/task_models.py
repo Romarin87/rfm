@@ -35,14 +35,31 @@ class MaskedEditHeads(nn.Module):
 class MaskedEditPretrainingModel(nn.Module):
     """Masked edit model with strict raw inputs: Z + masked BO/edit basis + optional D_R."""
 
-    def __init__(self, pair_raw_dim: int, hidden_dim: int, layers: int, dropout: float, input_schema: str):
+    def __init__(
+        self,
+        pair_raw_dim: int,
+        hidden_dim: int,
+        layers: int,
+        dropout: float,
+        input_schema: str,
+        dynamic_pair_update: bool = True,
+        dynamic_pair_update_scale: float = 0.75,
+        dynamic_pair_update_dropout: float | None = None,
+    ):
         super().__init__()
         self.adapter = MaskedEditAdapter(
             hidden_dim=hidden_dim,
             pair_input_dim=pair_raw_dim,
             input_schema=input_schema,
         )
-        self.encoder = TokenSpaceReactionEncoder(hidden_dim=hidden_dim, layers=layers, dropout=dropout)
+        self.encoder = TokenSpaceReactionEncoder(
+            hidden_dim=hidden_dim,
+            layers=layers,
+            dropout=dropout,
+            dynamic_pair_update=dynamic_pair_update,
+            dynamic_pair_update_scale=dynamic_pair_update_scale,
+            dynamic_pair_update_dropout=dynamic_pair_update_dropout,
+        )
         self.masked_edit_heads = MaskedEditHeads(hidden_dim)
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -60,7 +77,17 @@ class ReactionPropertyRegressor(nn.Module):
     D_R/D_P for the 3D variant.
     """
 
-    def __init__(self, pair_raw_dim: int, hidden_dim: int, layers: int, dropout: float, input_schema: str):
+    def __init__(
+        self,
+        pair_raw_dim: int,
+        hidden_dim: int,
+        layers: int,
+        dropout: float,
+        input_schema: str,
+        dynamic_pair_update: bool = True,
+        dynamic_pair_update_scale: float = 0.75,
+        dynamic_pair_update_dropout: float | None = None,
+    ):
         super().__init__()
         masked_schema, masked_pair_raw_dim = _masked_edit_schema_for_property(input_schema)
         self.adapter = RPairPropertyAdapter(
@@ -73,7 +100,14 @@ class ReactionPropertyRegressor(nn.Module):
             pair_input_dim=masked_pair_raw_dim,
             input_schema=masked_schema,
         )
-        self.encoder = TokenSpaceReactionEncoder(hidden_dim=hidden_dim, layers=layers, dropout=dropout)
+        self.encoder = TokenSpaceReactionEncoder(
+            hidden_dim=hidden_dim,
+            layers=layers,
+            dropout=dropout,
+            dynamic_pair_update=dynamic_pair_update,
+            dynamic_pair_update_scale=dynamic_pair_update_scale,
+            dynamic_pair_update_dropout=dynamic_pair_update_dropout,
+        )
         self.masked_edit_heads = MaskedEditHeads(hidden_dim)
         self.reg_head = nn.Sequential(
             nn.LayerNorm(hidden_dim * 2),
@@ -128,6 +162,9 @@ class SuirenFusionPropertyRegressor(nn.Module):
         suiren_graph_dim: int = 0,
         suiren_atom_dims: dict[str, int] | None = None,
         suiren_graph_dims: dict[str, int] | None = None,
+        dynamic_pair_update: bool = True,
+        dynamic_pair_update_scale: float = 0.75,
+        dynamic_pair_update_dropout: float | None = None,
     ):
         super().__init__()
         masked_schema, masked_pair_raw_dim = _masked_edit_schema_for_property(input_schema)
@@ -145,7 +182,14 @@ class SuirenFusionPropertyRegressor(nn.Module):
             pair_input_dim=masked_pair_raw_dim,
             input_schema=masked_schema,
         )
-        self.encoder = TokenSpaceReactionEncoder(hidden_dim=hidden_dim, layers=layers, dropout=dropout)
+        self.encoder = TokenSpaceReactionEncoder(
+            hidden_dim=hidden_dim,
+            layers=layers,
+            dropout=dropout,
+            dynamic_pair_update=dynamic_pair_update,
+            dynamic_pair_update_scale=dynamic_pair_update_scale,
+            dynamic_pair_update_dropout=dynamic_pair_update_dropout,
+        )
         self.masked_edit_heads = MaskedEditHeads(hidden_dim)
         self.reg_head = nn.Sequential(
             nn.LayerNorm(hidden_dim * 2),

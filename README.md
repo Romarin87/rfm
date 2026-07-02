@@ -6,6 +6,9 @@ documentation.
 
 ## Training Entry Points
 
+The default Reaction Encoder uses dynamic pair-token updates with residual
+scale `0.75`; pass `--no-dynamic-pair-update` only for ablation runs.
+
 ```bash
 PYTHONPATH=. python -m rfm.cli.train_masked_edit ...
 PYTHONPATH=. python -m rfm.cli.train_reaction_property ...

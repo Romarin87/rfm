@@ -123,5 +123,8 @@ weight_decay = 1e-4
 hidden_dim = 128
 layers = 3
 dropout = 0.1
+dynamic_pair_update = true
+dynamic_pair_update_scale = 0.75
+dynamic_pair_update_dropout = null
 gradient clipping = 5.0
 ```
