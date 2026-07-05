@@ -108,5 +108,28 @@ def reaction_property_pair_input(sample: dict[str, Any], args: Any) -> dict[str,
     }
 
 
+def product_edit_pair_input(sample: dict[str, Any], args: Any) -> dict[str, np.ndarray]:
+    """Build strict R-only product-edit inputs and Delta_BO labels.
+
+    `BO_P` and `Delta_BO` are returned only as supervision targets. The
+    encoder-facing `pair_input` contains no product-side graph or geometry.
+    """
+    bo_r, bo_p = bond_order_matrices(sample)
+    delta_bo = (bo_p - bo_r).astype(np.float32)
+    channels = [bo_r]
+    if args.geometry_mode == "irc_r":
+        channels.append(pairwise_distance(coordinates(sample, "R"), clip=None, normalize=False))
+    pair_input = np.stack(channels, axis=-1).astype(np.float32)
+    return {
+        "pair_input": pair_input,
+        "pair_valid": pair_valid_matrix(delta_bo.shape[0]),
+        "bo_r": bo_r,
+        "delta_bo": delta_bo,
+        "changed": changed_pairs(delta_bo),
+        "edit_class": edit_class_from_bo(bo_r, bo_p),
+        "core_atom": reaction_core_from_delta(delta_bo),
+    }
+
+
 def target_vector(sample: dict[str, Any], targets: tuple[str, ...] = ENERGY_TARGETS) -> np.ndarray:
     return np.asarray([float(sample["targets"][name]) for name in targets], dtype=np.float32)

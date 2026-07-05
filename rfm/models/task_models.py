@@ -6,7 +6,13 @@ import torch
 import torch.nn as nn
 
 from rfm.data.reaction_samples import EDIT_CLASSES, ENERGY_TARGETS
-from rfm.features.token_space import MaskedEditAdapter, RPairPropertyAdapter, TokenSpaceReactionEncoder, UnifiedReactionInputAdapter
+from rfm.features.token_space import (
+    MaskedEditAdapter,
+    ProductEditInputAdapter,
+    RPairPropertyAdapter,
+    TokenSpaceReactionEncoder,
+    UnifiedReactionInputAdapter,
+)
 
 
 class MaskedEditHeads(nn.Module):
@@ -30,6 +36,37 @@ class MaskedEditHeads(nn.Module):
             "edit_logits": self.edit_head(pair_repr),
             "core_logits": self.core_head(atom_h).squeeze(-1),
         }
+
+
+class ProductEditHead(nn.Module):
+    """Top-K Delta_BO candidate head over encoder atom/pair states."""
+
+    def __init__(self, hidden_dim: int, top_k: int, n_delta_classes: int, dropout: float):
+        super().__init__()
+        self.top_k = int(top_k)
+        self.n_delta_classes = int(n_delta_classes)
+        self.candidate_embedding = nn.Parameter(torch.zeros(self.top_k, hidden_dim))
+        nn.init.normal_(self.candidate_embedding, mean=0.0, std=0.02)
+        self.pair_context = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 4),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.candidate_context = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
+        self.out = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Dropout(dropout), nn.Linear(hidden_dim, n_delta_classes))
+
+    def forward(self, atom_h: torch.Tensor, pair_h: torch.Tensor, reaction_h: torch.Tensor) -> torch.Tensor:
+        batch, n_atoms, hidden = atom_h.shape
+        h_i = atom_h.unsqueeze(2).expand(batch, n_atoms, n_atoms, hidden)
+        h_j = atom_h.unsqueeze(1).expand(batch, n_atoms, n_atoms, hidden)
+        pair_base = self.pair_context(torch.cat([h_i, h_j, (h_i - h_j).abs(), pair_h], dim=-1))
+        candidate_query = reaction_h.unsqueeze(1) + self.candidate_embedding.unsqueeze(0)
+        candidate_base = self.candidate_context(candidate_query)
+        logits = self.out(pair_base.unsqueeze(1) + candidate_base.unsqueeze(2).unsqueeze(3))
+        logits = 0.5 * (logits + logits.transpose(2, 3))
+        return logits
 
 
 class MaskedEditPretrainingModel(nn.Module):
@@ -68,6 +105,53 @@ class MaskedEditPretrainingModel(nn.Module):
         out = self.masked_edit_heads(encoded["atom_h"], encoded["pair_h"])
         out["reaction_h"] = encoded["reaction_h"]
         return out
+
+
+class ProductEditPredictor(nn.Module):
+    """R-only top-K product graph-edit predictor."""
+
+    def __init__(
+        self,
+        pair_raw_dim: int,
+        hidden_dim: int,
+        layers: int,
+        dropout: float,
+        input_schema: str,
+        top_k: int,
+        n_delta_classes: int,
+        suiren_atom_dims: dict[str, int] | None = None,
+        suiren_graph_dims: dict[str, int] | None = None,
+        dynamic_pair_update: bool = True,
+        dynamic_pair_update_scale: float = 0.75,
+        dynamic_pair_update_dropout: float | None = None,
+    ):
+        super().__init__()
+        self.input_adapter = ProductEditInputAdapter(
+            hidden_dim=hidden_dim,
+            pair_input_dim=pair_raw_dim,
+            input_schema=input_schema,
+            suiren_atom_dims=suiren_atom_dims,
+            suiren_graph_dims=suiren_graph_dims,
+        )
+        self.encoder = TokenSpaceReactionEncoder(
+            hidden_dim=hidden_dim,
+            layers=layers,
+            dropout=dropout,
+            dynamic_pair_update=dynamic_pair_update,
+            dynamic_pair_update_scale=dynamic_pair_update_scale,
+            dynamic_pair_update_dropout=dynamic_pair_update_dropout,
+        )
+        self.product_edit_head = ProductEditHead(hidden_dim, top_k=top_k, n_delta_classes=n_delta_classes, dropout=dropout)
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        for key, value in batch.items():
+            if key.startswith("suiren_") and key.endswith("_failed") and bool(value.bool().any().item()):
+                raise ValueError(f"Suiren cache contains failed rows in {key}; rebuild the cache before training or evaluation")
+        encoded = self.encoder(self.input_adapter(batch))
+        return {
+            "delta_logits": self.product_edit_head(encoded["atom_h"], encoded["pair_h"], encoded["reaction_h"]),
+            "reaction_h": encoded["reaction_h"],
+        }
 
 
 class ReactionPropertyRegressor(nn.Module):

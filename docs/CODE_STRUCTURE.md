@@ -13,17 +13,19 @@ rfm/
   features/
     token_space.py         # 派生特征、ReactionInputFeaturizer、adapter、RFMEncoderInput
   models/
-    task_models.py         # masked edit / reaction property regression 模型封装
+    task_models.py         # masked edit / property regression / product-edit 模型封装
   optim/
     builder.py             # AdamW / Muon optimizer builder
     muon.py                # Muon optimizer implementation
   tasks/
     metrics.py             # regression / binary metrics
     masked_edit.py         # masked edit dataset、loss、eval、summary
+    product_edit.py        # R-only top-K product graph-edit dataset、loss、eval、summary
     reaction_property.py   # reaction property regression dataset、loss、eval、summary
     suiren_fusion_property.py # frozen Suiren cache + reaction property dataset
   cli/
     train_masked_edit.py        # masked edit pretraining 正式 CLI
+    train_product_edit.py       # R-only top-K product graph-edit 正式 CLI
     train_reaction_property.py  # reaction property regression 正式 CLI
     train_suiren_fusion_property.py # Suiren fusion property regression 正式 CLI
 ```
@@ -34,6 +36,7 @@ rfm/
 
 ```bash
 PYTHONPATH=. python -m rfm.cli.train_masked_edit ...
+PYTHONPATH=. python -m rfm.cli.train_product_edit ...
 PYTHONPATH=. python -m rfm.cli.train_reaction_property ...
 PYTHONPATH=. python -m rfm.cli.train_suiren_fusion_property ...
 ```
@@ -42,6 +45,7 @@ PYTHONPATH=. python -m rfm.cli.train_suiren_fusion_property ...
 
 ```bash
 PYTHONPATH=${BASE} python -m rfm.cli.train_masked_edit ...
+PYTHONPATH=${BASE} python -m rfm.cli.train_product_edit ...
 PYTHONPATH=${BASE} python -m rfm.cli.train_reaction_property ...
 PYTHONPATH=${BASE} python -m rfm.cli.train_suiren_fusion_property ...
 ```
@@ -102,6 +106,23 @@ active processed HDF5 只写 IRC R/P endpoint 坐标，不写 `coordinates_TS`�
 Suiren cache 训练/评估前必须验证 `failed.sum() == 0`；failed row 不能作为合法零特征进入模型。
 Reaction Encoder 输出接口固定为 `atom_h: [B,N,H]`、`pair_h: [B,N,N,H]`、
 `reaction_h: [B,H]`；property head / masked-edit heads 不随 Suiren feature 组合改变输入维度。
+
+R-only product graph-edit prediction:
+
+```text
+goal: R -> top-K product graph candidates
+encoder input, 2D: Z, BO_R
+encoder input, IRC-R: Z, BO_R, D_R_irc
+optional Suiren input: h_R_graph and/or h_R_atom only
+labels: Delta_BO = BO_P - BO_R, grouped by canonical reactant_key
+forbidden input: BO_P, Delta_BO, D_P_irc, h_P, Delta_h, abs_Delta_h
+output: top-K Delta_BO class matrices; BO_P_pred = BO_R + Delta_BO_pred
+```
+
+This task uses `ProductEditInputAdapter`, which keeps the same Reaction Encoder
+output interface (`atom_h`, `pair_h`, `reaction_h`) and does not add Suiren pair
+tokens. Existing R/P Suiren caches are sliced to the R-side block before entering
+the adapter.
 
 ## 4. Checkpoint Rule
 

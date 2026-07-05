@@ -157,6 +157,15 @@ PAIR_BASIS_SPECS: dict[str, ReactionPairBasisSpec] = {
         names=("BO_R", "A_R", "D_R"),
         has_r_3d=True,
     ),
+    "product_edit_r2d_bo": ReactionPairBasisSpec(
+        schema="product_edit_r2d_bo",
+        names=("BO_R", "A_R"),
+    ),
+    "product_edit_r3d_bo": ReactionPairBasisSpec(
+        schema="product_edit_r3d_bo",
+        names=("BO_R", "A_R", "D_R"),
+        has_r_3d=True,
+    ),
     "property_rp2d_bo": ReactionPairBasisSpec(
         schema="property_rp2d_bo",
         names=(
@@ -420,6 +429,15 @@ class ReactionInputFeaturizer(nn.Module):
             return torch.stack([bo_r, self._adjacency(bo_r)], dim=-1)
 
         if self.schema == "property_r3d_bo":
+            bo_r = pair_raw[..., 0]
+            d_r_norm = self._distance_basis(pair_raw[..., 1], already_normalized=False)
+            return torch.stack([bo_r, self._adjacency(bo_r), d_r_norm], dim=-1)
+
+        if self.schema == "product_edit_r2d_bo":
+            bo_r = pair_raw[..., 0]
+            return torch.stack([bo_r, self._adjacency(bo_r)], dim=-1)
+
+        if self.schema == "product_edit_r3d_bo":
             bo_r = pair_raw[..., 0]
             d_r_norm = self._distance_basis(pair_raw[..., 1], already_normalized=False)
             return torch.stack([bo_r, self._adjacency(bo_r), d_r_norm], dim=-1)
@@ -944,6 +962,136 @@ class UnifiedReactionInputAdapter(BaseRFMAdapter):
                 "suiren_atom_dims": self.suiren_atom_dims,
                 "suiren_graph_dims": self.suiren_graph_dims,
                 "suiren_pair_tokens": False,
+            },
+        )
+        out.validate()
+        return out
+
+
+class ProductEditInputAdapter(BaseRFMAdapter):
+    """R-only input adapter for product graph-edit prediction.
+
+    Product-side graph, Delta_BO, product-side geometry, and product-side
+    Suiren features are labels or prohibited information for this task. This
+    adapter therefore consumes only R graph/geometry plus optional R-only
+    frozen Suiren features.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        pair_input_dim: int,
+        input_schema: str,
+        suiren_atom_dim: int = 0,
+        suiren_graph_dim: int = 0,
+        suiren_atom_dims: dict[str, int] | None = None,
+        suiren_graph_dims: dict[str, int] | None = None,
+        max_z: int = 36,
+        distance_clip: float = 10.0,
+    ):
+        super().__init__(hidden_dim, task_name="product_edit")
+        self.featurizer = ReactionInputFeaturizer(input_schema, distance_clip=distance_clip)
+        self.suiren_atom_dims = dict(suiren_atom_dims or {})
+        self.suiren_graph_dims = dict(suiren_graph_dims or {})
+        if suiren_atom_dim > 0 and not self.suiren_atom_dims:
+            self.suiren_atom_dims["generic"] = suiren_atom_dim
+        if suiren_graph_dim > 0 and not self.suiren_graph_dims:
+            self.suiren_graph_dims["generic"] = suiren_graph_dim
+        self.pair_input_dim = pair_input_dim
+        self.z_embedding = nn.Embedding(max_z + 1, hidden_dim)
+        self.pair_projection = nn.Sequential(
+            nn.LayerNorm(self.featurizer.output_dim),
+            nn.Linear(self.featurizer.output_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.suiren_atom_projection = nn.ModuleDict(
+            {
+                name: nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+                for name, dim in sorted(self.suiren_atom_dims.items())
+                if dim > 0
+            }
+        )
+        self.suiren_graph_projection = nn.ModuleDict(
+            {
+                name: nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+                for name, dim in sorted(self.suiren_graph_dims.items())
+                if dim > 0
+            }
+        )
+
+    @staticmethod
+    def suiren_feature_key(stream: str, level: str) -> str:
+        if stream == "generic":
+            return f"suiren_{level}_features"
+        return f"suiren_{stream}_{level}_features"
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> RFMEncoderInput:
+        z = batch["z"].clamp(0, self.z_embedding.num_embeddings - 1)
+        atom_valid = batch["atom_mask"].bool()
+        pair_valid = batch.get("pair_valid", batch.get("pair_mask"))
+        if pair_valid is None:
+            pair_valid = valid_pair_mask(atom_valid)
+        pair_valid = pair_valid.bool()
+        batch_size, n_atoms = atom_valid.shape
+
+        pair_raw = batch["pair_input"] if "pair_input" in batch else batch["pair_feats"]
+        pair_basis = self.featurizer(pair_raw)
+        pair_tokens = self.pair_projection(pair_basis) * pair_valid.unsqueeze(-1)
+
+        atom_tokens = self.z_embedding(z)
+        has_atom = False
+        for stream, projection in self.suiren_atom_projection.items():
+            key = self.suiren_feature_key(stream, "atom")
+            if key not in batch:
+                continue
+            has_atom = True
+            atom_features = batch[key]
+            if atom_features.shape[:2] != (batch_size, n_atoms):
+                raise ValueError(f"{key} must be [B,N,C], got {tuple(atom_features.shape)}")
+            atom_tokens = atom_tokens + projection(atom_features)
+        atom_tokens = atom_tokens * atom_valid.unsqueeze(-1)
+
+        spec = self.featurizer.spec
+        has_graph = any(self.suiren_feature_key(stream, "graph") in batch for stream in self.suiren_graph_projection)
+        has_suiren = bool(has_atom or has_graph)
+        modality = self.modality_dict(
+            batch_size,
+            z.device,
+            has_R=spec.has_r,
+            has_P=False,
+            has_Delta_BO=False,
+            has_partial_Delta_BO=False,
+            has_R_3D=spec.has_r_3d,
+            has_P_3D=False,
+            has_Suiren_R=has_suiren,
+            has_Suiren_P=False,
+        )
+        reaction_token = self.reaction_from_atoms(atom_tokens, atom_valid, modality)
+        for stream, projection in self.suiren_graph_projection.items():
+            key = self.suiren_feature_key(stream, "graph")
+            if key not in batch:
+                continue
+            graph_features = batch[key]
+            if graph_features.shape[0] != batch_size:
+                raise ValueError(f"{key} must be [B,C], got {tuple(graph_features.shape)}")
+            reaction_token = reaction_token + projection(graph_features)
+
+        out = RFMEncoderInput(
+            atom_tokens,
+            pair_tokens,
+            reaction_token,
+            atom_valid,
+            pair_valid,
+            modality,
+            self.task_name,
+            metadata={
+                "pair_basis_schema": self.featurizer.schema,
+                "pair_basis_names": self.featurizer.spec.names,
+                "suiren_atom_dims": self.suiren_atom_dims,
+                "suiren_graph_dims": self.suiren_graph_dims,
+                "suiren_pair_tokens": False,
+                "product_side_inputs": False,
             },
         )
         out.validate()

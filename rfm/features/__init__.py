@@ -2,6 +2,7 @@
 
 from .token_space import (
     MaskedEditAdapter,
+    ProductEditInputAdapter,
     RFMEncoderInput,
     RPairPropertyAdapter,
     ReactionInputFeaturizer,
@@ -18,6 +19,7 @@ from .token_space import (
 
 __all__ = [
     "MaskedEditAdapter",
+    "ProductEditInputAdapter",
     "RFMEncoderInput",
     "RPairPropertyAdapter",
     "ReactionInputFeaturizer",
