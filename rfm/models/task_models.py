@@ -69,6 +69,85 @@ class ProductEditHead(nn.Module):
         return logits
 
 
+class ProductEditProposalHead(nn.Module):
+    """WLDN-style reaction-center and Delta_BO proposal head."""
+
+    def __init__(self, hidden_dim: int, n_delta_classes: int, dropout: float):
+        super().__init__()
+        self.pair_context = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 4),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.reaction_context = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
+        self.change_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Dropout(dropout), nn.Linear(hidden_dim, 1))
+        self.delta_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Dropout(dropout), nn.Linear(hidden_dim, n_delta_classes))
+
+    def forward(self, atom_h: torch.Tensor, pair_h: torch.Tensor, reaction_h: torch.Tensor) -> dict[str, torch.Tensor]:
+        batch, n_atoms, hidden = atom_h.shape
+        h_i = atom_h.unsqueeze(2).expand(batch, n_atoms, n_atoms, hidden)
+        h_j = atom_h.unsqueeze(1).expand(batch, n_atoms, n_atoms, hidden)
+        pair_base = self.pair_context(torch.cat([h_i, h_j, (h_i - h_j).abs(), pair_h], dim=-1))
+        pair_base = pair_base + self.reaction_context(reaction_h).view(batch, 1, 1, hidden)
+        change_logits = self.change_head(pair_base).squeeze(-1)
+        delta_logits = self.delta_head(pair_base)
+        change_logits = 0.5 * (change_logits + change_logits.transpose(1, 2))
+        delta_logits = 0.5 * (delta_logits + delta_logits.transpose(1, 2))
+        return {"change_logits": change_logits, "delta_logits": delta_logits, "pair_context": pair_base}
+
+
+class ProductEditCandidateRanker(nn.Module):
+    """Score candidate product graphs from reactant encoder states and Delta_BO edits."""
+
+    def __init__(self, hidden_dim: int, dropout: float):
+        super().__init__()
+        self.delta_projection = nn.Sequential(
+            nn.LayerNorm(5),
+            nn.Linear(5, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.diff_projection = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.score = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        pair_h: torch.Tensor,
+        reaction_h: torch.Tensor,
+        bo_r: torch.Tensor,
+        pair_valid: torch.Tensor,
+        candidate_delta_bo: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, n_candidates, n_atoms, _ = candidate_delta_bo.shape
+        bo_r_expanded = bo_r.unsqueeze(1).expand(batch, n_candidates, n_atoms, n_atoms)
+        bo_p = bo_r_expanded + candidate_delta_bo
+        abs_delta = candidate_delta_bo.abs()
+        changed = (abs_delta > 1e-6).float()
+        raw = torch.stack([bo_r_expanded, bo_p, candidate_delta_bo, abs_delta, changed], dim=-1)
+        diff_pair = self.delta_projection(raw) + pair_h.unsqueeze(1)
+        pair_mask = torch.triu(pair_valid.bool(), diagonal=1).unsqueeze(1)
+        changed_mask = pair_mask & (changed > 0.0)
+        weights = changed_mask.float().unsqueeze(-1)
+        pooled = (diff_pair * weights).sum(dim=(2, 3)) / weights.sum(dim=(2, 3)).clamp_min(1.0)
+        pooled = self.diff_projection(pooled)
+        reaction = reaction_h.unsqueeze(1).expand(batch, n_candidates, reaction_h.shape[-1])
+        return self.score(torch.cat([reaction, pooled], dim=-1)).squeeze(-1)
+
+
 class MaskedEditPretrainingModel(nn.Module):
     """Masked edit model with strict raw inputs: Z + masked BO/edit basis + optional D_R."""
 
@@ -152,6 +231,69 @@ class ProductEditPredictor(nn.Module):
             "delta_logits": self.product_edit_head(encoded["atom_h"], encoded["pair_h"], encoded["reaction_h"]),
             "reaction_h": encoded["reaction_h"],
         }
+
+
+class WLDNProductEditPredictor(nn.Module):
+    """R-only product prediction via reaction-center proposal and candidate ranking."""
+
+    def __init__(
+        self,
+        pair_raw_dim: int,
+        hidden_dim: int,
+        layers: int,
+        dropout: float,
+        input_schema: str,
+        n_delta_classes: int,
+        suiren_atom_dims: dict[str, int] | None = None,
+        suiren_graph_dims: dict[str, int] | None = None,
+        dynamic_pair_update: bool = True,
+        dynamic_pair_update_scale: float = 0.75,
+        dynamic_pair_update_dropout: float | None = None,
+    ):
+        super().__init__()
+        self.input_adapter = ProductEditInputAdapter(
+            hidden_dim=hidden_dim,
+            pair_input_dim=pair_raw_dim,
+            input_schema=input_schema,
+            suiren_atom_dims=suiren_atom_dims,
+            suiren_graph_dims=suiren_graph_dims,
+        )
+        self.encoder = TokenSpaceReactionEncoder(
+            hidden_dim=hidden_dim,
+            layers=layers,
+            dropout=dropout,
+            dynamic_pair_update=dynamic_pair_update,
+            dynamic_pair_update_scale=dynamic_pair_update_scale,
+            dynamic_pair_update_dropout=dynamic_pair_update_dropout,
+        )
+        self.proposal_head = ProductEditProposalHead(hidden_dim, n_delta_classes=n_delta_classes, dropout=dropout)
+        self.candidate_ranker = ProductEditCandidateRanker(hidden_dim, dropout=dropout)
+
+    def _check_suiren_failed(self, batch: dict[str, torch.Tensor]) -> None:
+        for key, value in batch.items():
+            if key.startswith("suiren_") and key.endswith("_failed") and bool(value.bool().any().item()):
+                raise ValueError(f"Suiren cache contains failed rows in {key}; rebuild the cache before training or evaluation")
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        self._check_suiren_failed(batch)
+        encoded = self.encoder(self.input_adapter(batch))
+        proposal = self.proposal_head(encoded["atom_h"], encoded["pair_h"], encoded["reaction_h"])
+        proposal.update({"pair_h": encoded["pair_h"], "reaction_h": encoded["reaction_h"]})
+        return proposal
+
+    def score_candidates(
+        self,
+        out: dict[str, torch.Tensor],
+        batch: dict[str, torch.Tensor],
+        candidate_delta_bo: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.candidate_ranker(
+            out["pair_h"],
+            out["reaction_h"],
+            batch["bo_r"].float(),
+            batch["pair_valid"].bool(),
+            candidate_delta_bo.float(),
+        )
 
 
 class ReactionPropertyRegressor(nn.Module):
