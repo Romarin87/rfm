@@ -89,6 +89,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--suiren-3d-graph-cache", default="")
     parser.add_argument("--suiren-2d-atom-cache", default="")
     parser.add_argument("--suiren-3d-atom-cache", default="")
+    parser.add_argument("--valid-suiren-2d-graph-cache", default="")
+    parser.add_argument("--valid-suiren-3d-graph-cache", default="")
+    parser.add_argument("--valid-suiren-2d-atom-cache", default="")
+    parser.add_argument("--valid-suiren-3d-atom-cache", default="")
+    parser.add_argument("--test-suiren-2d-graph-cache", default="")
+    parser.add_argument("--test-suiren-3d-graph-cache", default="")
+    parser.add_argument("--test-suiren-2d-atom-cache", default="")
+    parser.add_argument("--test-suiren-3d-atom-cache", default="")
     parser.add_argument("--suiren-cache-layout", choices=("rp_delta_abs", "rp_delta", "r_only"), default="rp_delta_abs")
     parser.add_argument("--trust-suiren-cache", action="store_true")
     parser.add_argument("--preload-suiren-graph-cache", action="store_true")
@@ -101,6 +109,20 @@ def product_edit_schema(args: argparse.Namespace) -> tuple[str, int]:
     if args.geometry_mode == "irc_r":
         return "product_edit_r3d_bo", 2
     return "product_edit_r2d_bo", 1
+
+
+def split_cache_args(args: argparse.Namespace, split: str) -> argparse.Namespace:
+    out = argparse.Namespace(**vars(args))
+    if split not in {"valid", "test"}:
+        return out
+    for stream in ("2d", "3d"):
+        for level in ("graph", "atom"):
+            split_key = f"{split}_suiren_{stream}_{level}_cache"
+            base_key = f"suiren_{stream}_{level}_cache"
+            value = getattr(args, split_key, "")
+            if value:
+                setattr(out, base_key, value)
+    return out
 
 
 def _main_model(model: nn.Module) -> nn.Module:
@@ -118,9 +140,11 @@ def main(argv: list[str] | None = None) -> None:
     if ddp_enabled():
         dist.barrier()
 
+    valid_args = split_cache_args(args, "valid")
+    test_args = split_cache_args(args, "test")
     train_ds = product_edit_wldn.ProductEditDataset(args.train, args.max_train, args)
-    valid_ds = product_edit_wldn.ProductEditDataset(args.valid, args.max_valid, args, delta_vocab=train_ds.delta_vocab)
-    test_ds = product_edit_wldn.ProductEditDataset(args.test, args.max_test, args, delta_vocab=train_ds.delta_vocab)
+    valid_ds = product_edit_wldn.ProductEditDataset(args.valid, args.max_valid, valid_args, delta_vocab=train_ds.delta_vocab)
+    test_ds = product_edit_wldn.ProductEditDataset(args.test, args.max_test, test_args, delta_vocab=train_ds.delta_vocab)
     train_sampler = DistributedSampler(train_ds, shuffle=True, seed=args.seed) if ddp_enabled() else None
     train_loader = DataLoader(
         train_ds,
