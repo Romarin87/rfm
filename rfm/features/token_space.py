@@ -558,15 +558,24 @@ def batch_bool(batch_size: int, value: bool, device: torch.device) -> torch.Tens
 class TokenPairMessageLayer(nn.Module):
     """Message-passing layer over canonical atom/pair tokens."""
 
-    def __init__(self, hidden_dim: int, dropout: float, dynamic_pair_update: bool = False):
+    def __init__(
+        self,
+        hidden_dim: int,
+        dropout: float,
+        dynamic_pair_update: bool = False,
+        dynamic_pair_update_scale: float = 1.0,
+        dynamic_pair_update_dropout: float | None = None,
+    ):
         super().__init__()
         self.dynamic_pair_update = bool(dynamic_pair_update)
+        self.dynamic_pair_update_scale = float(dynamic_pair_update_scale)
         if self.dynamic_pair_update:
+            pair_dropout = dropout if dynamic_pair_update_dropout is None else float(dynamic_pair_update_dropout)
             self.pair_update = nn.Sequential(
                 nn.LayerNorm(hidden_dim * 3),
                 nn.Linear(hidden_dim * 3, hidden_dim),
                 nn.SiLU(),
-                nn.Dropout(dropout),
+                nn.Dropout(pair_dropout),
                 nn.Linear(hidden_dim, hidden_dim),
             )
             self.pair_norm = nn.LayerNorm(hidden_dim)
@@ -597,7 +606,7 @@ class TokenPairMessageLayer(nn.Module):
         h_j = atom_h.unsqueeze(1).expand(batch, n_atoms, n_atoms, hidden)
         if self.dynamic_pair_update:
             pair_repr = torch.cat([h_i, h_j, pair_h], dim=-1)
-            pair_h = self.pair_norm(pair_h + self.pair_update(pair_repr))
+            pair_h = self.pair_norm(pair_h + self.dynamic_pair_update_scale * self.pair_update(pair_repr))
             pair_h = pair_h * pair_valid_mask.unsqueeze(-1)
         msg = self.message(torch.cat([h_i, h_j, pair_h], dim=-1))
         msg = msg * pair_valid_mask.unsqueeze(-1)
@@ -610,10 +619,27 @@ class TokenPairMessageLayer(nn.Module):
 class TokenSpaceReactionEncoder(nn.Module):
     """Shared trunk that consumes `RFMEncoderInput`, independent of raw modality."""
 
-    def __init__(self, hidden_dim: int, layers: int, dropout: float, dynamic_pair_update: bool = False):
+    def __init__(
+        self,
+        hidden_dim: int,
+        layers: int,
+        dropout: float,
+        dynamic_pair_update: bool = False,
+        dynamic_pair_update_scale: float = 1.0,
+        dynamic_pair_update_dropout: float | None = None,
+    ):
         super().__init__()
         self.layers = nn.ModuleList(
-            [TokenPairMessageLayer(hidden_dim, dropout, dynamic_pair_update=dynamic_pair_update) for _ in range(layers)]
+            [
+                TokenPairMessageLayer(
+                    hidden_dim,
+                    dropout,
+                    dynamic_pair_update=dynamic_pair_update,
+                    dynamic_pair_update_scale=dynamic_pair_update_scale,
+                    dynamic_pair_update_dropout=dynamic_pair_update_dropout,
+                )
+                for _ in range(layers)
+            ]
         )
         self.reaction_update = nn.Sequential(
             nn.LayerNorm(hidden_dim * 2),

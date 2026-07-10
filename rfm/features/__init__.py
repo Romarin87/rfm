@@ -1,5 +1,6 @@
 """Input featurizers and canonical token-space adapters."""
 
+from .radar import RADARReactionEncoder, RADARReactionInputAdapter
 from .token_space import (
     MaskedEditAdapter,
     RFMEncoderInput,
@@ -18,6 +19,8 @@ from .token_space import (
 
 __all__ = [
     "MaskedEditAdapter",
+    "RADARReactionEncoder",
+    "RADARReactionInputAdapter",
     "RFMEncoderInput",
     "RPairPropertyAdapter",
     "ReactionInputFeaturizer",

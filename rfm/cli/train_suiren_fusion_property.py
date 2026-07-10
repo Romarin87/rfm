@@ -16,7 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
-from rfm.models import SuirenFusionPropertyRegressor, load_pretrained_encoder
+from rfm.models import SuirenFusionPropertyRegressor, load_pretrained_encoder, load_stage_a_checkpoint
 from rfm.optim import build_optimizer
 from rfm.tasks import suiren_fusion_property
 from rfm.utils.runtime import (
@@ -44,6 +44,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.add_argument(f"--{split}-suiren-{stream}-atom-cache", default="")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--run-id", default="")
+    parser.add_argument("--pretrained-stage-a", default="")
     parser.add_argument("--pretrained-encoder", default="")
     parser.add_argument("--freeze-encoder", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
@@ -56,6 +57,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--encoder-type", choices=("token_space", "radar"), default="token_space")
+    parser.add_argument("--radar-attention-heads", type=int, default=8)
+    parser.add_argument("--radar-center-router", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--radar-delta-stream", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--radar-pair-update-scale", type=float, default=0.75)
+    parser.add_argument("--radar-reaction-update-scale", type=float, default=1.0)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--geometry-mode", choices=("2d", "irc_rp"), default="2d")
     parser.add_argument("--stage-a-weight", type=float, default=0.5)
@@ -71,6 +78,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--forward-reverse-consistency-weight", type=float, default=0.0)
     parser.add_argument("--enable-suiren-input-gates", action="store_true")
     parser.add_argument("--enable-dynamic-pair-update", action="store_true")
+    parser.add_argument("--dynamic-pair-update-scale", type=float, default=1.0)
+    parser.add_argument("--dynamic-pair-update-dropout", type=float, default=None)
     parser.add_argument("--enable-attention-readout", action="store_true")
     parser.add_argument("--enable-directional-3d-adapter", action="store_true")
     parser.add_argument("--edit-class-weights", default="1.0,4.0,4.0,2.0")
@@ -131,6 +140,39 @@ class InterleavedForwardReverseSampler(Sampler[int]):
 
     def __len__(self) -> int:
         return self.dataset_size
+
+
+class DistributedInterleavedForwardReverseSampler(Sampler[int]):
+    """DDP sampler that shards adjacent forward/reverse pairs by rank."""
+
+    def __init__(self, dataset_size: int, seed: int, num_replicas: int, rank: int):
+        if dataset_size % 2:
+            raise ValueError("forward/reverse consistency training requires an even-sized augmented train split")
+        self.dataset_size = int(dataset_size)
+        self.seed = int(seed)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.epoch = 0
+        self.num_pairs = self.dataset_size // 2
+        self.num_pairs_per_rank = (self.num_pairs + self.num_replicas - 1) // self.num_replicas
+        self.total_pairs = self.num_pairs_per_rank * self.num_replicas
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        pair_starts = (torch.randperm(self.num_pairs, generator=generator) * 2).tolist()
+        if self.total_pairs > self.num_pairs:
+            pair_starts.extend(pair_starts[: self.total_pairs - self.num_pairs])
+        rank_pair_starts = pair_starts[self.rank : self.total_pairs : self.num_replicas]
+        for start in rank_pair_starts:
+            yield int(start)
+            yield int(start) + 1
+
+    def __len__(self) -> int:
+        return self.num_pairs_per_rank * 2
 
 
 def reaction_property_schema(args: argparse.Namespace) -> tuple[str, int]:
@@ -213,7 +255,11 @@ def main(argv: list[str] | None = None) -> None:
     if train_ds.suiren_atom_dims != valid_ds.suiren_atom_dims or train_ds.suiren_atom_dims != test_ds.suiren_atom_dims:
         raise ValueError("Suiren atom feature dimensions differ across splits")
 
-    if ddp_enabled():
+    if ddp_enabled() and args.forward_reverse_consistency_weight > 0.0:
+        if args.batch_size % 2:
+            raise ValueError("forward/reverse consistency training requires an even per-rank --batch-size")
+        train_sampler = DistributedInterleavedForwardReverseSampler(len(train_ds), args.seed, world, rank)
+    elif ddp_enabled():
         train_sampler = DistributedSampler(train_ds, shuffle=True, seed=args.seed)
     elif args.forward_reverse_consistency_weight > 0.0:
         train_sampler = InterleavedForwardReverseSampler(len(train_ds), args.seed)
@@ -256,15 +302,29 @@ def main(argv: list[str] | None = None) -> None:
         suiren_graph_dims=train_ds.suiren_graph_dims,
         enable_suiren_input_gates=args.enable_suiren_input_gates,
         dynamic_pair_update=args.enable_dynamic_pair_update,
+        dynamic_pair_update_scale=args.dynamic_pair_update_scale,
+        dynamic_pair_update_dropout=args.dynamic_pair_update_dropout,
         attention_readout=args.enable_attention_readout,
         directional_3d_adapter=args.enable_directional_3d_adapter,
+        encoder_type=args.encoder_type,
+        radar_attention_heads=args.radar_attention_heads,
+        radar_center_router=args.radar_center_router,
+        radar_delta_stream=args.radar_delta_stream,
+        radar_pair_update_scale=args.radar_pair_update_scale,
+        radar_reaction_update_scale=args.radar_reaction_update_scale,
     ).to(device)
-    if args.pretrained_encoder:
+    if args.pretrained_stage_a and args.pretrained_encoder:
+        raise ValueError("use either --pretrained-stage-a or --pretrained-encoder, not both")
+    if args.pretrained_stage_a:
+        load_stage_a_checkpoint(model, args.pretrained_stage_a, device)
+    elif args.pretrained_encoder:
+        if args.encoder_type == "radar":
+            raise ValueError("RADAR Stage C requires --pretrained-stage-a so the adapter and edit heads are restored")
         load_pretrained_encoder(model, args.pretrained_encoder, device)
     if args.freeze_encoder:
         for param in model.encoder.parameters():
             param.requires_grad = False
-    train_model: nn.Module = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=args.freeze_encoder) if ddp_enabled() and device.type == "cuda" else model
+    train_model: nn.Module = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True) if ddp_enabled() and device.type == "cuda" else model
     optimizer = build_optimizer(train_model.named_parameters(), args)
 
     history: list[dict[str, Any]] = []
@@ -323,9 +383,12 @@ def main(argv: list[str] | None = None) -> None:
             "epoch": best_epoch,
             "seed": args.seed,
             "world_size": world,
+            "pretrained_stage_a": args.pretrained_stage_a,
             "pretrained_encoder": args.pretrained_encoder,
             "freeze_encoder": args.freeze_encoder,
             "input_schema": input_schema,
+            "encoder_type": args.encoder_type,
+            "encoder_class": type(model.encoder).__name__,
             "optimizer": args.optimizer,
             "optimizer_metadata": getattr(optimizer, "metadata", {"optimizer": args.optimizer}),
             "epochs_requested": args.epochs,
@@ -334,8 +397,16 @@ def main(argv: list[str] | None = None) -> None:
             "early_stop_patience": args.early_stop_patience,
             "early_stop_min_delta": args.early_stop_min_delta,
             "model_improvement_switches": {
+                "encoder_type": args.encoder_type,
+                "radar_attention_heads": args.radar_attention_heads,
+                "radar_center_router": args.radar_center_router,
+                "radar_delta_stream": args.radar_delta_stream,
+                "radar_pair_update_scale": args.radar_pair_update_scale,
+                "radar_reaction_update_scale": args.radar_reaction_update_scale,
                 "suiren_input_gates": args.enable_suiren_input_gates,
                 "dynamic_pair_update": args.enable_dynamic_pair_update,
+                "dynamic_pair_update_scale": args.dynamic_pair_update_scale,
+                "dynamic_pair_update_dropout": args.dynamic_pair_update_dropout,
                 "attention_readout": args.enable_attention_readout,
                 "directional_3d_adapter": args.enable_directional_3d_adapter,
                 "forward_reverse_consistency_weight": args.forward_reverse_consistency_weight,
@@ -348,10 +419,20 @@ def main(argv: list[str] | None = None) -> None:
             "sizes": {"train": len(train_ds), "valid": len(valid_ds), "test": len(test_ds)},
             "suiren_feature_dims": cache_info["dims"],
         }
-        torch.save({"model": best_state, "config": vars(args), "target_mean": best["target_mean"], "target_std": best["target_std"], "model_class": "SuirenFusionPropertyRegressor"}, output_dir / "model.pt")
+        torch.save(
+            {
+                "model": best_state,
+                "config": vars(args),
+                "target_mean": best["target_mean"],
+                "target_std": best["target_std"],
+                "model_class": "SuirenFusionPropertyRegressor",
+                "encoder_class": type(model.encoder).__name__,
+            },
+            output_dir / "model.pt",
+        )
         torch.save({"input_adapter": model.input_adapter.state_dict(), "config": vars(args), "feature_dims": cache_info["dims"]}, output_dir / "unified_reaction_input_adapter.pt")
         torch.save({"adapter": model.masked_adapter.state_dict(), "config": vars(args)}, output_dir / "masked_edit_adapter.pt")
-        torch.save({"encoder": model.encoder.state_dict(), "config": vars(args), "model_class": "TokenSpaceReactionEncoder"}, output_dir / "reaction_encoder.pt")
+        torch.save({"encoder": model.encoder.state_dict(), "config": vars(args), "model_class": type(model.encoder).__name__}, output_dir / "reaction_encoder.pt")
         torch.save({"masked_edit_heads": model.masked_edit_heads.state_dict(), "config": vars(args)}, output_dir / "masked_edit_heads.pt")
         torch.save({"property_head": model.reg_head.state_dict(), "config": vars(args)}, output_dir / "property_head.pt")
         write_json(output_dir / "metrics.json", best)
@@ -366,7 +447,16 @@ def main(argv: list[str] | None = None) -> None:
                 "sizes": best["sizes"],
                 "geometry_mode": args.geometry_mode,
                 "input_schema": input_schema,
+                "encoder_type": args.encoder_type,
+                "encoder_class": type(model.encoder).__name__,
                 "suiren_feature_dims": cache_info["dims"],
+                "radar": {
+                    "attention_heads": args.radar_attention_heads,
+                    "center_router": args.radar_center_router,
+                    "delta_stream": args.radar_delta_stream,
+                    "pair_update_scale": args.radar_pair_update_scale,
+                    "reaction_update_scale": args.radar_reaction_update_scale,
+                },
                 "suiren_input_semantics": {
                     "graph_features": "initial_reaction_token_input_projection",
                     "atom_features": "atom_token_input_projection_aligned_by_atom_map_order",
@@ -400,8 +490,16 @@ def main(argv: list[str] | None = None) -> None:
                     "prefetch_factor": args.prefetch_factor if args.num_workers > 0 else None,
                 },
                 "model_improvement_switches": {
+                    "encoder_type": args.encoder_type,
+                    "radar_attention_heads": args.radar_attention_heads,
+                    "radar_center_router": args.radar_center_router,
+                    "radar_delta_stream": args.radar_delta_stream,
+                    "radar_pair_update_scale": args.radar_pair_update_scale,
+                    "radar_reaction_update_scale": args.radar_reaction_update_scale,
                     "suiren_input_gates": args.enable_suiren_input_gates,
                     "dynamic_pair_update": args.enable_dynamic_pair_update,
+                    "dynamic_pair_update_scale": args.dynamic_pair_update_scale,
+                    "dynamic_pair_update_dropout": args.dynamic_pair_update_dropout,
                     "attention_readout": args.enable_attention_readout,
                     "directional_3d_adapter": args.enable_directional_3d_adapter,
                 },
@@ -421,9 +519,12 @@ def main(argv: list[str] | None = None) -> None:
             status="complete",
             notes=(
                 f"input_schema={input_schema}; geometry_mode={args.geometry_mode}; suiren=unified_input; "
+                f"encoder_type={args.encoder_type}; "
+                f"stage_a_checkpoint={args.pretrained_stage_a or args.pretrained_encoder}; "
                 f"loss=0.5*L_A+1.0*L_C+{args.forward_reverse_consistency_weight}*L_FR; "
                 f"selection=minimum valid_loss; optimizer={args.optimizer}; suiren_dims={cache_info['dims']}; "
                 f"switches=gates:{args.enable_suiren_input_gates},dynamic_pair:{args.enable_dynamic_pair_update},"
+                f"dynamic_pair_scale:{args.dynamic_pair_update_scale},dynamic_pair_dropout:{args.dynamic_pair_update_dropout},"
                 f"attention_readout:{args.enable_attention_readout},directional_3d:{args.enable_directional_3d_adapter}"
             ),
         )

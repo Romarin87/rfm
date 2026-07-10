@@ -16,7 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from rfm.models import ReactionPropertyRegressor, load_pretrained_encoder
+from rfm.models import ReactionPropertyRegressor, load_pretrained_encoder, load_stage_a_checkpoint
 from rfm.optim import build_optimizer
 from rfm.tasks import reaction_property
 from rfm.utils.runtime import (
@@ -40,6 +40,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--test", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--run-id", default="")
+    parser.add_argument("--pretrained-stage-a", default="")
     parser.add_argument("--pretrained-encoder", default="")
     parser.add_argument("--freeze-encoder", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
@@ -52,6 +53,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--encoder-type", choices=("token_space", "radar"), default="token_space")
+    parser.add_argument("--radar-attention-heads", type=int, default=8)
+    parser.add_argument("--radar-center-router", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--radar-delta-stream", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--radar-pair-update-scale", type=float, default=0.75)
+    parser.add_argument("--radar-reaction-update-scale", type=float, default=1.0)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--geometry-mode", choices=("2d", "irc_rp"), default="2d")
     parser.add_argument("--stage-a-weight", type=float, default=0.5)
@@ -118,8 +125,26 @@ def main(argv: list[str] | None = None) -> None:
     y_mean = y_mean.to(device)
     y_std = y_std.to(device)
     input_schema, pair_raw_dim = reaction_property_schema(args)
-    model = ReactionPropertyRegressor(pair_raw_dim, args.hidden_dim, args.layers, args.dropout, input_schema=input_schema).to(device)
-    if args.pretrained_encoder:
+    model = ReactionPropertyRegressor(
+        pair_raw_dim,
+        args.hidden_dim,
+        args.layers,
+        args.dropout,
+        input_schema=input_schema,
+        encoder_type=args.encoder_type,
+        radar_attention_heads=args.radar_attention_heads,
+        radar_center_router=args.radar_center_router,
+        radar_delta_stream=args.radar_delta_stream,
+        radar_pair_update_scale=args.radar_pair_update_scale,
+        radar_reaction_update_scale=args.radar_reaction_update_scale,
+    ).to(device)
+    if args.pretrained_stage_a and args.pretrained_encoder:
+        raise ValueError("use either --pretrained-stage-a or --pretrained-encoder, not both")
+    if args.pretrained_stage_a:
+        load_stage_a_checkpoint(model, args.pretrained_stage_a, device)
+    elif args.pretrained_encoder:
+        if args.encoder_type == "radar":
+            raise ValueError("RADAR Stage B requires --pretrained-stage-a so the adapter and edit heads are restored")
         load_pretrained_encoder(model, args.pretrained_encoder, device)
     if args.freeze_encoder:
         for param in model.encoder.parameters():
@@ -194,9 +219,12 @@ def main(argv: list[str] | None = None) -> None:
             "epoch": best_epoch,
             "seed": args.seed,
             "world_size": world,
+            "pretrained_stage_a": args.pretrained_stage_a,
             "pretrained_encoder": args.pretrained_encoder,
             "freeze_encoder": args.freeze_encoder,
             "input_schema": input_schema,
+            "encoder_type": args.encoder_type,
+            "encoder_class": type(model.encoder).__name__,
             "optimizer": args.optimizer,
             "optimizer_metadata": getattr(optimizer, "metadata", {"optimizer": args.optimizer}),
             "epochs_requested": args.epochs,
@@ -211,10 +239,20 @@ def main(argv: list[str] | None = None) -> None:
             "target_std": y_std.detach().cpu().numpy().tolist(),
             "sizes": {"train": len(train_ds), "valid": len(valid_ds), "test": len(test_ds)},
         }
-        torch.save({"model": best_state, "config": vars(args), "target_mean": best["target_mean"], "target_std": best["target_std"], "model_class": "ReactionPropertyRegressor"}, output_dir / "model.pt")
+        torch.save(
+            {
+                "model": best_state,
+                "config": vars(args),
+                "target_mean": best["target_mean"],
+                "target_std": best["target_std"],
+                "model_class": "ReactionPropertyRegressor",
+                "encoder_class": type(model.encoder).__name__,
+            },
+            output_dir / "model.pt",
+        )
         torch.save({"adapter": model.adapter.state_dict(), "config": vars(args)}, output_dir / "rpair_property_adapter.pt")
         torch.save({"adapter": model.masked_adapter.state_dict(), "config": vars(args)}, output_dir / "masked_edit_adapter.pt")
-        torch.save({"encoder": model.encoder.state_dict(), "config": vars(args), "model_class": "TokenSpaceReactionEncoder"}, output_dir / "reaction_encoder.pt")
+        torch.save({"encoder": model.encoder.state_dict(), "config": vars(args), "model_class": type(model.encoder).__name__}, output_dir / "reaction_encoder.pt")
         torch.save({"masked_edit_heads": model.masked_edit_heads.state_dict(), "config": vars(args)}, output_dir / "masked_edit_heads.pt")
         write_json(output_dir / "metrics.json", best)
         write_json(output_dir / "history.json", history)
@@ -227,6 +265,15 @@ def main(argv: list[str] | None = None) -> None:
                 "sizes": best["sizes"],
                 "geometry_mode": args.geometry_mode,
                 "input_schema": input_schema,
+                "encoder_type": args.encoder_type,
+                "encoder_class": type(model.encoder).__name__,
+                "radar": {
+                    "attention_heads": args.radar_attention_heads,
+                    "center_router": args.radar_center_router,
+                    "delta_stream": args.radar_delta_stream,
+                    "pair_update_scale": args.radar_pair_update_scale,
+                    "reaction_update_scale": args.radar_reaction_update_scale,
+                },
                 "loss": {
                     "stage_a_weight": args.stage_a_weight,
                     "property_weight": args.property_weight,
@@ -256,7 +303,11 @@ def main(argv: list[str] | None = None) -> None:
             task="reaction_property_regression",
             model="ReactionPropertyRegressor",
             status="complete",
-            notes=f"input_schema={input_schema}; geometry_mode={args.geometry_mode}; loss=0.5*L_A+1.0*L_B; selection=minimum valid_loss; optimizer={args.optimizer}",
+            notes=(
+                f"input_schema={input_schema}; geometry_mode={args.geometry_mode}; encoder_type={args.encoder_type}; "
+                f"stage_a_checkpoint={args.pretrained_stage_a or args.pretrained_encoder}; "
+                f"loss=0.5*L_A+1.0*L_B; selection=minimum valid_loss; optimizer={args.optimizer}"
+            ),
         )
         print(json.dumps(best, indent=2, ensure_ascii=False), flush=True)
     cleanup_ddp()

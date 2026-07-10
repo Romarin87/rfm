@@ -51,6 +51,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--encoder-type", choices=("token_space", "radar"), default="token_space")
+    parser.add_argument("--radar-attention-heads", type=int, default=8)
+    parser.add_argument("--radar-center-router", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--radar-delta-stream", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--radar-pair-update-scale", type=float, default=0.75)
+    parser.add_argument("--radar-reaction-update-scale", type=float, default=1.0)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--geometry-mode", choices=("2d", "irc_rp"), default="2d")
     parser.add_argument("--mask-strategy", choices=("reaction_center", "changed_enriched", "random_pair"), default="reaction_center")
@@ -61,6 +67,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--changed-weight", type=float, default=0.5)
     parser.add_argument("--edit-weight", type=float, default=0.5)
     parser.add_argument("--core-weight", type=float, default=0.2)
+    parser.add_argument("--enable-dynamic-pair-update", action="store_true")
+    parser.add_argument("--dynamic-pair-update-scale", type=float, default=1.0)
+    parser.add_argument("--dynamic-pair-update-dropout", type=float, default=None)
     parser.add_argument("--edit-class-weights", default="1.0,4.0,4.0,2.0")
     parser.add_argument("--max-train", type=int, default=0)
     parser.add_argument("--max-valid", type=int, default=0)
@@ -112,7 +121,22 @@ def main(argv: list[str] | None = None) -> None:
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, collate_fn=masked_edit.collate, num_workers=args.num_workers, pin_memory=torch.cuda.is_available())
 
     input_schema, pair_raw_dim = masked_edit_schema(args)
-    model = MaskedEditPretrainingModel(pair_raw_dim, args.hidden_dim, args.layers, args.dropout, input_schema=input_schema).to(device)
+    model = MaskedEditPretrainingModel(
+        pair_raw_dim,
+        args.hidden_dim,
+        args.layers,
+        args.dropout,
+        input_schema=input_schema,
+        dynamic_pair_update=args.enable_dynamic_pair_update,
+        dynamic_pair_update_scale=args.dynamic_pair_update_scale,
+        dynamic_pair_update_dropout=args.dynamic_pair_update_dropout,
+        encoder_type=args.encoder_type,
+        radar_attention_heads=args.radar_attention_heads,
+        radar_center_router=args.radar_center_router,
+        radar_delta_stream=args.radar_delta_stream,
+        radar_pair_update_scale=args.radar_pair_update_scale,
+        radar_reaction_update_scale=args.radar_reaction_update_scale,
+    ).to(device)
     train_model: nn.Module = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False) if ddp_enabled() and device.type == "cuda" else model
     optimizer = build_optimizer(train_model.named_parameters(), args)
     weight_values = masked_edit.parse_float_list(args.edit_class_weights)
@@ -190,6 +214,8 @@ def main(argv: list[str] | None = None) -> None:
             "sizes": {"train": len(train_ds), "valid": len(valid_ds), "test": len(test_ds)},
             "edit_classes": EDIT_CLASSES,
             "model": "MaskedEditPretrainingModel",
+            "encoder_type": args.encoder_type,
+            "encoder_class": type(model.encoder).__name__,
             "input_schema": input_schema,
             "optimizer": args.optimizer,
             "optimizer_metadata": getattr(optimizer, "metadata", {"optimizer": args.optimizer}),
@@ -200,9 +226,9 @@ def main(argv: list[str] | None = None) -> None:
             "early_stop_min_delta": args.early_stop_min_delta,
             "selection": {"criterion": "valid_loss", "best_valid_loss": best_valid_loss, "best_valid_loss_parts": best_valid_loss_parts},
         }
-        torch.save({"model": best_state, "config": vars(args), "model_class": "MaskedEditPretrainingModel"}, output_dir / "model.pt")
+        torch.save({"model": best_state, "config": vars(args), "model_class": "MaskedEditPretrainingModel", "encoder_class": type(model.encoder).__name__}, output_dir / "model.pt")
         torch.save({"adapter": model.adapter.state_dict(), "config": vars(args)}, output_dir / "masked_edit_adapter.pt")
-        torch.save({"encoder": model.encoder.state_dict(), "config": vars(args), "model_class": "TokenSpaceReactionEncoder"}, output_dir / "reaction_encoder.pt")
+        torch.save({"encoder": model.encoder.state_dict(), "config": vars(args), "model_class": type(model.encoder).__name__}, output_dir / "reaction_encoder.pt")
         torch.save({"masked_edit_heads": model.masked_edit_heads.state_dict(), "config": vars(args), "edit_classes": EDIT_CLASSES}, output_dir / "masked_edit_heads.pt")
         write_json(output_dir / "metrics.json", best)
         write_json(output_dir / "history.json", history)
@@ -215,6 +241,15 @@ def main(argv: list[str] | None = None) -> None:
                 "sizes": best["sizes"],
                 "geometry_mode": args.geometry_mode,
                 "input_schema": input_schema,
+                "encoder_type": args.encoder_type,
+                "encoder_class": type(model.encoder).__name__,
+                "radar": {
+                    "attention_heads": args.radar_attention_heads,
+                    "center_router": args.radar_center_router,
+                    "delta_stream": args.radar_delta_stream,
+                    "pair_update_scale": args.radar_pair_update_scale,
+                    "reaction_update_scale": args.radar_reaction_update_scale,
+                },
                 "mask_strategy": args.mask_strategy,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             },
@@ -229,7 +264,10 @@ def main(argv: list[str] | None = None) -> None:
             task="masked_delta_bo_edit_core",
             model="MaskedEditPretrainingModel",
             status="complete",
-            notes=f"input_schema={input_schema}; geometry_mode={args.geometry_mode}; selection=minimum valid_loss; optimizer={args.optimizer}",
+            notes=(
+                f"input_schema={input_schema}; geometry_mode={args.geometry_mode}; encoder_type={args.encoder_type}; "
+                f"selection=minimum valid_loss; optimizer={args.optimizer}"
+            ),
         )
         print(json.dumps(best, indent=2, ensure_ascii=False), flush=True)
     cleanup_ddp()

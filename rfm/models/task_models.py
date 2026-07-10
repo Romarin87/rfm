@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 
 from rfm.data.reaction_samples import EDIT_CLASSES, ENERGY_TARGETS
+from rfm.features.radar import RADARReactionEncoder, RADARReactionInputAdapter
 from rfm.features.token_space import MaskedEditAdapter, RPairPropertyAdapter, TokenSpaceReactionEncoder, UnifiedReactionInputAdapter
 
 
@@ -32,43 +35,115 @@ class AtomAttentionReadout(nn.Module):
 class MaskedEditHeads(nn.Module):
     """Masked Delta_BO, changed pair, edit class, and core atom heads."""
 
-    def __init__(self, hidden_dim: int):
+    def __init__(self, hidden_dim: int, use_router_logits: bool = False):
         super().__init__()
+        self.use_router_logits = bool(use_router_logits)
         self.delta_head = nn.Sequential(nn.LayerNorm(hidden_dim * 3), nn.Linear(hidden_dim * 3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
-        self.changed_head = nn.Sequential(nn.LayerNorm(hidden_dim * 3), nn.Linear(hidden_dim * 3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
         self.edit_head = nn.Sequential(nn.LayerNorm(hidden_dim * 3), nn.Linear(hidden_dim * 3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, len(EDIT_CLASSES)))
-        self.core_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        if not self.use_router_logits:
+            self.changed_head = nn.Sequential(nn.LayerNorm(hidden_dim * 3), nn.Linear(hidden_dim * 3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+            self.core_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
 
-    def forward(self, atom_h: torch.Tensor, pair_h: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        atom_h: torch.Tensor,
+        pair_h: torch.Tensor,
+        *,
+        router_atom_logits: torch.Tensor | None = None,
+        router_pair_logits: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         batch, n_atoms, hidden = atom_h.shape
         h_i = atom_h.unsqueeze(2).expand(batch, n_atoms, n_atoms, hidden)
         h_j = atom_h.unsqueeze(1).expand(batch, n_atoms, n_atoms, hidden)
         pair_repr = torch.cat([h_i, h_j, pair_h], dim=-1)
-        return {
+        out = {
             "delta_bo": self.delta_head(pair_repr).squeeze(-1),
-            "changed_logits": self.changed_head(pair_repr).squeeze(-1),
             "edit_logits": self.edit_head(pair_repr),
-            "core_logits": self.core_head(atom_h).squeeze(-1),
         }
+        if self.use_router_logits:
+            if router_atom_logits is None or router_pair_logits is None:
+                raise ValueError("RADAR masked-edit heads require atom and pair router logits")
+            out["changed_logits"] = router_pair_logits
+            out["core_logits"] = router_atom_logits
+        else:
+            out["changed_logits"] = self.changed_head(pair_repr).squeeze(-1)
+            out["core_logits"] = self.core_head(atom_h).squeeze(-1)
+        return out
+
+
+def _masked_edit_outputs(heads: MaskedEditHeads, encoded: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return heads(
+        encoded["atom_h"],
+        encoded["pair_h"],
+        router_atom_logits=encoded.get("radar_center_atom_logits"),
+        router_pair_logits=encoded.get("radar_center_pair_logits"),
+    )
 
 
 class MaskedEditPretrainingModel(nn.Module):
     """Masked edit model with strict raw inputs: Z + masked BO/edit basis + optional D_R."""
 
-    def __init__(self, pair_raw_dim: int, hidden_dim: int, layers: int, dropout: float, input_schema: str):
+    def __init__(
+        self,
+        pair_raw_dim: int,
+        hidden_dim: int,
+        layers: int,
+        dropout: float,
+        input_schema: str,
+        dynamic_pair_update: bool = False,
+        dynamic_pair_update_scale: float = 1.0,
+        dynamic_pair_update_dropout: float | None = None,
+        encoder_type: str = "token_space",
+        radar_attention_heads: int = 8,
+        radar_center_router: bool = True,
+        radar_delta_stream: bool = True,
+        radar_pair_update_scale: float = 0.75,
+        radar_reaction_update_scale: float = 1.0,
+    ):
         super().__init__()
-        self.adapter = MaskedEditAdapter(
-            hidden_dim=hidden_dim,
-            pair_input_dim=pair_raw_dim,
-            input_schema=input_schema,
+        self.encoder_type = encoder_type
+        if encoder_type == "radar":
+            self.adapter = RADARReactionInputAdapter(
+                hidden_dim=hidden_dim,
+                pair_input_dim=pair_raw_dim,
+                input_schema=input_schema,
+                task_name="masked_edit",
+                enable_delta_stream=radar_delta_stream,
+            )
+            self.encoder = RADARReactionEncoder(
+                hidden_dim=hidden_dim,
+                layers=layers,
+                dropout=dropout,
+                attention_heads=radar_attention_heads,
+                center_router=radar_center_router,
+                pair_update_scale=radar_pair_update_scale,
+                reaction_update_scale=radar_reaction_update_scale,
+            )
+        elif encoder_type == "token_space":
+            self.adapter = MaskedEditAdapter(
+                hidden_dim=hidden_dim,
+                pair_input_dim=pair_raw_dim,
+                input_schema=input_schema,
+            )
+            self.encoder = TokenSpaceReactionEncoder(
+                hidden_dim=hidden_dim,
+                layers=layers,
+                dropout=dropout,
+                dynamic_pair_update=dynamic_pair_update,
+                dynamic_pair_update_scale=dynamic_pair_update_scale,
+                dynamic_pair_update_dropout=dynamic_pair_update_dropout,
+            )
+        else:
+            raise ValueError(f"unsupported encoder_type={encoder_type!r}")
+        self.masked_edit_heads = MaskedEditHeads(
+            hidden_dim,
+            use_router_logits=encoder_type == "radar" and radar_center_router,
         )
-        self.encoder = TokenSpaceReactionEncoder(hidden_dim=hidden_dim, layers=layers, dropout=dropout)
-        self.masked_edit_heads = MaskedEditHeads(hidden_dim)
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         encoder_input = self.adapter(batch)
         encoded = self.encoder(encoder_input)
-        out = self.masked_edit_heads(encoded["atom_h"], encoded["pair_h"])
+        out = _masked_edit_outputs(self.masked_edit_heads, encoded)
         out["reaction_h"] = encoded["reaction_h"]
         return out
 
@@ -88,29 +163,72 @@ class ReactionPropertyRegressor(nn.Module):
         dropout: float,
         input_schema: str,
         dynamic_pair_update: bool = False,
+        dynamic_pair_update_scale: float = 1.0,
+        dynamic_pair_update_dropout: float | None = None,
         attention_readout: bool = False,
         directional_3d_adapter: bool = False,
+        encoder_type: str = "token_space",
+        radar_attention_heads: int = 8,
+        radar_center_router: bool = True,
+        radar_delta_stream: bool = True,
+        radar_pair_update_scale: float = 0.75,
+        radar_reaction_update_scale: float = 1.0,
     ):
         super().__init__()
         masked_schema, masked_pair_raw_dim = _masked_edit_schema_for_property(input_schema)
-        self.adapter = RPairPropertyAdapter(
-            hidden_dim=hidden_dim,
-            pair_input_dim=pair_raw_dim,
-            input_schema=input_schema,
-            directional_3d_adapter=directional_3d_adapter,
+        self.encoder_type = encoder_type
+        if encoder_type == "radar":
+            if directional_3d_adapter:
+                raise ValueError("directional_3d_adapter is only supported by encoder_type='token_space'")
+            self.adapter = RADARReactionInputAdapter(
+                hidden_dim=hidden_dim,
+                pair_input_dim=pair_raw_dim,
+                input_schema=input_schema,
+                task_name="property",
+                enable_delta_stream=radar_delta_stream,
+            )
+            self.masked_adapter = RADARReactionInputAdapter(
+                hidden_dim=hidden_dim,
+                pair_input_dim=masked_pair_raw_dim,
+                input_schema=masked_schema,
+                task_name="masked_edit",
+                enable_delta_stream=radar_delta_stream,
+            )
+            self.encoder = RADARReactionEncoder(
+                hidden_dim=hidden_dim,
+                layers=layers,
+                dropout=dropout,
+                attention_heads=radar_attention_heads,
+                center_router=radar_center_router,
+                pair_update_scale=radar_pair_update_scale,
+                reaction_update_scale=radar_reaction_update_scale,
+            )
+        elif encoder_type == "token_space":
+            self.adapter = RPairPropertyAdapter(
+                hidden_dim=hidden_dim,
+                pair_input_dim=pair_raw_dim,
+                input_schema=input_schema,
+                directional_3d_adapter=directional_3d_adapter,
+            )
+            self.masked_adapter = MaskedEditAdapter(
+                hidden_dim=hidden_dim,
+                pair_input_dim=masked_pair_raw_dim,
+                input_schema=masked_schema,
+            )
+            self.encoder = TokenSpaceReactionEncoder(
+                hidden_dim=hidden_dim,
+                layers=layers,
+                dropout=dropout,
+                dynamic_pair_update=dynamic_pair_update,
+                dynamic_pair_update_scale=dynamic_pair_update_scale,
+                dynamic_pair_update_dropout=dynamic_pair_update_dropout,
+            )
+        else:
+            raise ValueError(f"unsupported encoder_type={encoder_type!r}")
+        self.masked_edit_heads = MaskedEditHeads(
+            hidden_dim,
+            use_router_logits=encoder_type == "radar" and radar_center_router,
         )
-        self.masked_adapter = MaskedEditAdapter(
-            hidden_dim=hidden_dim,
-            pair_input_dim=masked_pair_raw_dim,
-            input_schema=masked_schema,
-        )
-        self.encoder = TokenSpaceReactionEncoder(
-            hidden_dim=hidden_dim,
-            layers=layers,
-            dropout=dropout,
-            dynamic_pair_update=dynamic_pair_update,
-        )
-        self.masked_edit_heads = MaskedEditHeads(hidden_dim)
         self.atom_readout = AtomAttentionReadout(hidden_dim) if attention_readout else None
         self.reg_head = nn.Sequential(
             nn.LayerNorm(hidden_dim * 2),
@@ -149,7 +267,7 @@ class ReactionPropertyRegressor(nn.Module):
             "pair_valid": batch["masked_pair_valid"],
         }
         encoded = self.encoder(self.masked_adapter(masked_batch))
-        out = self.masked_edit_heads(encoded["atom_h"], encoded["pair_h"])
+        out = _masked_edit_outputs(self.masked_edit_heads, encoded)
         out["reaction_h"] = encoded["reaction_h"]
         return out
 
@@ -170,34 +288,82 @@ class SuirenFusionPropertyRegressor(nn.Module):
         suiren_graph_dims: dict[str, int] | None = None,
         enable_suiren_input_gates: bool = False,
         dynamic_pair_update: bool = False,
+        dynamic_pair_update_scale: float = 1.0,
+        dynamic_pair_update_dropout: float | None = None,
         attention_readout: bool = False,
         directional_3d_adapter: bool = False,
+        encoder_type: str = "token_space",
+        radar_attention_heads: int = 8,
+        radar_center_router: bool = True,
+        radar_delta_stream: bool = True,
+        radar_pair_update_scale: float = 0.75,
+        radar_reaction_update_scale: float = 1.0,
     ):
         super().__init__()
         masked_schema, masked_pair_raw_dim = _masked_edit_schema_for_property(input_schema)
-        self.input_adapter = UnifiedReactionInputAdapter(
-            hidden_dim=hidden_dim,
-            pair_input_dim=pair_raw_dim,
-            input_schema=input_schema,
-            suiren_atom_dim=suiren_atom_dim,
-            suiren_graph_dim=suiren_graph_dim,
-            suiren_atom_dims=suiren_atom_dims,
-            suiren_graph_dims=suiren_graph_dims,
-            enable_suiren_gates=enable_suiren_input_gates,
-            directional_3d_adapter=directional_3d_adapter,
+        self.encoder_type = encoder_type
+        if encoder_type == "radar":
+            if directional_3d_adapter:
+                raise ValueError("directional_3d_adapter is only supported by encoder_type='token_space'")
+            self.input_adapter = RADARReactionInputAdapter(
+                hidden_dim=hidden_dim,
+                pair_input_dim=pair_raw_dim,
+                input_schema=input_schema,
+                task_name="suiren_fusion_property",
+                suiren_atom_dim=suiren_atom_dim,
+                suiren_graph_dim=suiren_graph_dim,
+                suiren_atom_dims=suiren_atom_dims,
+                suiren_graph_dims=suiren_graph_dims,
+                enable_delta_stream=radar_delta_stream,
+                enable_suiren_gates=enable_suiren_input_gates,
+            )
+            self.masked_adapter = RADARReactionInputAdapter(
+                hidden_dim=hidden_dim,
+                pair_input_dim=masked_pair_raw_dim,
+                input_schema=masked_schema,
+                task_name="masked_edit",
+                enable_delta_stream=radar_delta_stream,
+            )
+            self.encoder = RADARReactionEncoder(
+                hidden_dim=hidden_dim,
+                layers=layers,
+                dropout=dropout,
+                attention_heads=radar_attention_heads,
+                center_router=radar_center_router,
+                pair_update_scale=radar_pair_update_scale,
+                reaction_update_scale=radar_reaction_update_scale,
+            )
+        elif encoder_type == "token_space":
+            self.input_adapter = UnifiedReactionInputAdapter(
+                hidden_dim=hidden_dim,
+                pair_input_dim=pair_raw_dim,
+                input_schema=input_schema,
+                suiren_atom_dim=suiren_atom_dim,
+                suiren_graph_dim=suiren_graph_dim,
+                suiren_atom_dims=suiren_atom_dims,
+                suiren_graph_dims=suiren_graph_dims,
+                enable_suiren_gates=enable_suiren_input_gates,
+                directional_3d_adapter=directional_3d_adapter,
+            )
+            self.masked_adapter = MaskedEditAdapter(
+                hidden_dim=hidden_dim,
+                pair_input_dim=masked_pair_raw_dim,
+                input_schema=masked_schema,
+            )
+            self.encoder = TokenSpaceReactionEncoder(
+                hidden_dim=hidden_dim,
+                layers=layers,
+                dropout=dropout,
+                dynamic_pair_update=dynamic_pair_update,
+                dynamic_pair_update_scale=dynamic_pair_update_scale,
+                dynamic_pair_update_dropout=dynamic_pair_update_dropout,
+            )
+        else:
+            raise ValueError(f"unsupported encoder_type={encoder_type!r}")
+        self.masked_edit_heads = MaskedEditHeads(
+            hidden_dim,
+            use_router_logits=encoder_type == "radar" and radar_center_router,
         )
-        self.masked_adapter = MaskedEditAdapter(
-            hidden_dim=hidden_dim,
-            pair_input_dim=masked_pair_raw_dim,
-            input_schema=masked_schema,
-        )
-        self.encoder = TokenSpaceReactionEncoder(
-            hidden_dim=hidden_dim,
-            layers=layers,
-            dropout=dropout,
-            dynamic_pair_update=dynamic_pair_update,
-        )
-        self.masked_edit_heads = MaskedEditHeads(hidden_dim)
         self.atom_readout = AtomAttentionReadout(hidden_dim) if attention_readout else None
         self.reg_head = nn.Sequential(
             nn.LayerNorm(hidden_dim * 2),
@@ -240,7 +406,7 @@ class SuirenFusionPropertyRegressor(nn.Module):
             "pair_valid": batch["masked_pair_valid"],
         }
         encoded = self.encoder(self.masked_adapter(masked_batch))
-        out = self.masked_edit_heads(encoded["atom_h"], encoded["pair_h"])
+        out = _masked_edit_outputs(self.masked_edit_heads, encoded)
         out["reaction_h"] = encoded["reaction_h"]
         return out
 
@@ -267,3 +433,38 @@ def load_pretrained_encoder(model: nn.Module, path: str, device: torch.device) -
     ]
     if bad_missing or unexpected:
         raise RuntimeError(f"pretrained encoder load mismatch: missing={bad_missing[:10]} unexpected={unexpected[:10]}")
+
+
+def load_stage_a_checkpoint(model: nn.Module, path: str, device: torch.device) -> Path:
+    """Restore the complete Stage A state used by Stage B/C multi-task training."""
+
+    checkpoint = Path(path)
+    if checkpoint.is_dir():
+        checkpoint = checkpoint / "model.pt"
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Stage A checkpoint not found: {checkpoint}")
+
+    payload = torch.load(checkpoint, map_location=device, weights_only=False)
+    if not isinstance(payload, dict) or not isinstance(payload.get("model"), dict):
+        raise ValueError(f"Stage A checkpoint must contain a full model state: {checkpoint}")
+    state = payload["model"]
+    source_encoder_type = payload.get("config", {}).get("encoder_type")
+    target_encoder_type = getattr(model, "encoder_type", None)
+    if source_encoder_type and target_encoder_type and source_encoder_type != target_encoder_type:
+        raise ValueError(
+            f"Stage A encoder_type mismatch: source={source_encoder_type} target={target_encoder_type}"
+        )
+
+    def component(prefix: str) -> dict[str, torch.Tensor]:
+        start = f"{prefix}."
+        values = {key[len(start) :]: value for key, value in state.items() if key.startswith(start)}
+        if not values:
+            raise ValueError(f"Stage A checkpoint is missing component {prefix!r}: {checkpoint}")
+        return values
+
+    if not hasattr(model, "masked_adapter") or not hasattr(model, "masked_edit_heads"):
+        raise TypeError("target model must expose masked_adapter and masked_edit_heads")
+    model.encoder.load_state_dict(component("encoder"), strict=True)
+    model.masked_adapter.load_state_dict(component("adapter"), strict=True)
+    model.masked_edit_heads.load_state_dict(component("masked_edit_heads"), strict=True)
+    return checkpoint
