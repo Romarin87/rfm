@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import torch
@@ -35,14 +36,27 @@ class AtomAttentionReadout(nn.Module):
 class MaskedEditHeads(nn.Module):
     """Masked Delta_BO, changed pair, edit class, and core atom heads."""
 
-    def __init__(self, hidden_dim: int, use_router_logits: bool = False):
+    def __init__(self, hidden_dim: int, router_residual: bool = False, router_gate_init: float = 0.05):
         super().__init__()
-        self.use_router_logits = bool(use_router_logits)
+        self.router_residual = bool(router_residual)
         self.delta_head = nn.Sequential(nn.LayerNorm(hidden_dim * 3), nn.Linear(hidden_dim * 3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        self.changed_head = nn.Sequential(nn.LayerNorm(hidden_dim * 3), nn.Linear(hidden_dim * 3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
         self.edit_head = nn.Sequential(nn.LayerNorm(hidden_dim * 3), nn.Linear(hidden_dim * 3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, len(EDIT_CLASSES)))
-        if not self.use_router_logits:
-            self.changed_head = nn.Sequential(nn.LayerNorm(hidden_dim * 3), nn.Linear(hidden_dim * 3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
-            self.core_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        self.core_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        if self.router_residual:
+            if not 0.0 < router_gate_init < 1.0:
+                raise ValueError(f"router_gate_init must be in (0,1), got {router_gate_init}")
+            gate_logit = math.log(router_gate_init / (1.0 - router_gate_init))
+            self.router_pair_gate_logit = nn.Parameter(torch.tensor(gate_logit, dtype=torch.float32))
+            self.router_atom_gate_logit = nn.Parameter(torch.tensor(gate_logit, dtype=torch.float32))
+
+    def router_gate_values(self) -> dict[str, float]:
+        if not self.router_residual:
+            return {}
+        return {
+            "pair": float(torch.sigmoid(self.router_pair_gate_logit).detach().cpu()),
+            "atom": float(torch.sigmoid(self.router_atom_gate_logit).detach().cpu()),
+        }
 
     def forward(
         self,
@@ -56,18 +70,23 @@ class MaskedEditHeads(nn.Module):
         h_i = atom_h.unsqueeze(2).expand(batch, n_atoms, n_atoms, hidden)
         h_j = atom_h.unsqueeze(1).expand(batch, n_atoms, n_atoms, hidden)
         pair_repr = torch.cat([h_i, h_j, pair_h], dim=-1)
-        out = {
+        changed_logits = self.changed_head(pair_repr).squeeze(-1)
+        core_logits = self.core_head(atom_h).squeeze(-1)
+        out: dict[str, torch.Tensor] = {
             "delta_bo": self.delta_head(pair_repr).squeeze(-1),
+            "changed_logits": changed_logits,
             "edit_logits": self.edit_head(pair_repr),
+            "core_logits": core_logits,
         }
-        if self.use_router_logits:
+        if self.router_residual:
             if router_atom_logits is None or router_pair_logits is None:
                 raise ValueError("RADAR masked-edit heads require atom and pair router logits")
-            out["changed_logits"] = router_pair_logits
-            out["core_logits"] = router_atom_logits
-        else:
-            out["changed_logits"] = self.changed_head(pair_repr).squeeze(-1)
-            out["core_logits"] = self.core_head(atom_h).squeeze(-1)
+            pair_gate = torch.sigmoid(self.router_pair_gate_logit)
+            atom_gate = torch.sigmoid(self.router_atom_gate_logit)
+            out["changed_logits"] = changed_logits + pair_gate * torch.tanh(router_pair_logits)
+            out["core_logits"] = core_logits + atom_gate * torch.tanh(router_atom_logits)
+            out["router_pair_logits"] = router_pair_logits
+            out["router_atom_logits"] = router_atom_logits
         return out
 
 
@@ -99,6 +118,7 @@ class MaskedEditPretrainingModel(nn.Module):
         radar_delta_stream: bool = True,
         radar_pair_update_scale: float = 0.75,
         radar_reaction_update_scale: float = 1.0,
+        radar_router_gate_init: float = 0.05,
     ):
         super().__init__()
         self.encoder_type = encoder_type
@@ -137,7 +157,8 @@ class MaskedEditPretrainingModel(nn.Module):
             raise ValueError(f"unsupported encoder_type={encoder_type!r}")
         self.masked_edit_heads = MaskedEditHeads(
             hidden_dim,
-            use_router_logits=encoder_type == "radar" and radar_center_router,
+            router_residual=encoder_type == "radar" and radar_center_router,
+            router_gate_init=radar_router_gate_init,
         )
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -173,6 +194,7 @@ class ReactionPropertyRegressor(nn.Module):
         radar_delta_stream: bool = True,
         radar_pair_update_scale: float = 0.75,
         radar_reaction_update_scale: float = 1.0,
+        radar_router_gate_init: float = 0.05,
     ):
         super().__init__()
         masked_schema, masked_pair_raw_dim = _masked_edit_schema_for_property(input_schema)
@@ -227,7 +249,8 @@ class ReactionPropertyRegressor(nn.Module):
             raise ValueError(f"unsupported encoder_type={encoder_type!r}")
         self.masked_edit_heads = MaskedEditHeads(
             hidden_dim,
-            use_router_logits=encoder_type == "radar" and radar_center_router,
+            router_residual=encoder_type == "radar" and radar_center_router,
+            router_gate_init=radar_router_gate_init,
         )
         self.atom_readout = AtomAttentionReadout(hidden_dim) if attention_readout else None
         self.reg_head = nn.Sequential(
@@ -298,6 +321,7 @@ class SuirenFusionPropertyRegressor(nn.Module):
         radar_delta_stream: bool = True,
         radar_pair_update_scale: float = 0.75,
         radar_reaction_update_scale: float = 1.0,
+        radar_router_gate_init: float = 0.05,
     ):
         super().__init__()
         masked_schema, masked_pair_raw_dim = _masked_edit_schema_for_property(input_schema)
@@ -362,7 +386,8 @@ class SuirenFusionPropertyRegressor(nn.Module):
             raise ValueError(f"unsupported encoder_type={encoder_type!r}")
         self.masked_edit_heads = MaskedEditHeads(
             hidden_dim,
-            use_router_logits=encoder_type == "radar" and radar_center_router,
+            router_residual=encoder_type == "radar" and radar_center_router,
+            router_gate_init=radar_router_gate_init,
         )
         self.atom_readout = AtomAttentionReadout(hidden_dim) if attention_readout else None
         self.reg_head = nn.Sequential(

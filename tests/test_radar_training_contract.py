@@ -44,12 +44,15 @@ class RADARTrainingContractTest(unittest.TestCase):
             radar_attention_heads=4,
         )
         out = model(synthetic_batch())
-        loss = sum(value.float().square().mean() for key, value in out.items() if key != "reaction_h")
+        loss = sum(
+            out[key].float().square().mean()
+            for key in ("delta_bo", "changed_logits", "edit_logits", "core_logits")
+        )
         loss.backward()
         missing = [name for name, parameter in model.named_parameters() if parameter.requires_grad and parameter.grad is None]
         self.assertEqual(missing, [])
 
-    def test_changed_and_core_predictions_are_router_logits(self) -> None:
+    def test_changed_and_core_predictions_use_gated_router_residuals(self) -> None:
         model = MaskedEditPretrainingModel(
             4,
             32,
@@ -63,8 +66,28 @@ class RADARTrainingContractTest(unittest.TestCase):
         with torch.no_grad():
             encoded = model.encoder(model.adapter(batch))
             out = model(batch)
-        torch.testing.assert_close(out["changed_logits"], encoded["radar_center_pair_logits"])
-        torch.testing.assert_close(out["core_logits"], encoded["radar_center_atom_logits"])
+            heads = model.masked_edit_heads
+            atom_h, pair_h = encoded["atom_h"], encoded["pair_h"]
+            batch_size, n_atoms, hidden = atom_h.shape
+            h_i = atom_h.unsqueeze(2).expand(batch_size, n_atoms, n_atoms, hidden)
+            h_j = atom_h.unsqueeze(1).expand(batch_size, n_atoms, n_atoms, hidden)
+            pair_repr = torch.cat([h_i, h_j, pair_h], dim=-1)
+            head_changed = heads.changed_head(pair_repr).squeeze(-1)
+            head_core = heads.core_head(atom_h).squeeze(-1)
+            pair_gate = torch.sigmoid(heads.router_pair_gate_logit)
+            atom_gate = torch.sigmoid(heads.router_atom_gate_logit)
+        torch.testing.assert_close(pair_gate, torch.tensor(0.05))
+        torch.testing.assert_close(atom_gate, torch.tensor(0.05))
+        torch.testing.assert_close(
+            out["changed_logits"],
+            head_changed + pair_gate * torch.tanh(encoded["radar_center_pair_logits"]),
+        )
+        torch.testing.assert_close(
+            out["core_logits"],
+            head_core + atom_gate * torch.tanh(encoded["radar_center_atom_logits"]),
+        )
+        torch.testing.assert_close(out["router_pair_logits"], encoded["radar_center_pair_logits"])
+        torch.testing.assert_close(out["router_atom_logits"], encoded["radar_center_atom_logits"])
 
     def test_soft_pool_stays_normalized_for_very_negative_logits(self) -> None:
         values = torch.tensor([[[2.0], [4.0]]])

@@ -57,6 +57,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--radar-delta-stream", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--radar-pair-update-scale", type=float, default=0.75)
     parser.add_argument("--radar-reaction-update-scale", type=float, default=1.0)
+    parser.add_argument("--radar-router-gate-init", type=float, default=0.05)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--geometry-mode", choices=("2d", "irc_rp"), default="2d")
     parser.add_argument("--mask-strategy", choices=("reaction_center", "changed_enriched", "random_pair"), default="reaction_center")
@@ -136,6 +137,7 @@ def main(argv: list[str] | None = None) -> None:
         radar_delta_stream=args.radar_delta_stream,
         radar_pair_update_scale=args.radar_pair_update_scale,
         radar_reaction_update_scale=args.radar_reaction_update_scale,
+        radar_router_gate_init=args.radar_router_gate_init,
     ).to(device)
     train_model: nn.Module = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False) if ddp_enabled() and device.type == "cuda" else model
     optimizer = build_optimizer(train_model.named_parameters(), args)
@@ -161,7 +163,13 @@ def main(argv: list[str] | None = None) -> None:
         if is_main(rank):
             valid_loss = masked_edit.evaluate_loss(model, valid_loader, device, args, edit_class_weights)
             valid_metrics, _ = masked_edit.evaluate(model, valid_loader, device, max_prediction_rows=0)
-            row = {"epoch": epoch, "train": train_metrics, "valid_loss": valid_loss, "valid": valid_metrics}
+            row = {
+                "epoch": epoch,
+                "train": train_metrics,
+                "valid_loss": valid_loss,
+                "valid": valid_metrics,
+                "router_gates": model.masked_edit_heads.router_gate_values(),
+            }
             history.append(row)
             print(json.dumps(row, ensure_ascii=False), flush=True)
             if valid_loss["loss"] < best_valid_loss - args.early_stop_min_delta:
@@ -224,6 +232,7 @@ def main(argv: list[str] | None = None) -> None:
             "early_stopped": early_stopped,
             "early_stop_patience": args.early_stop_patience,
             "early_stop_min_delta": args.early_stop_min_delta,
+            "router_gates": model.masked_edit_heads.router_gate_values(),
             "selection": {"criterion": "valid_loss", "best_valid_loss": best_valid_loss, "best_valid_loss_parts": best_valid_loss_parts},
         }
         torch.save({"model": best_state, "config": vars(args), "model_class": "MaskedEditPretrainingModel", "encoder_class": type(model.encoder).__name__}, output_dir / "model.pt")
@@ -249,6 +258,8 @@ def main(argv: list[str] | None = None) -> None:
                     "delta_stream": args.radar_delta_stream,
                     "pair_update_scale": args.radar_pair_update_scale,
                     "reaction_update_scale": args.radar_reaction_update_scale,
+                    "router_gate_init": args.radar_router_gate_init,
+                    "router_residual": args.radar_center_router,
                 },
                 "mask_strategy": args.mask_strategy,
                 "generated_at": datetime.now(timezone.utc).isoformat(),

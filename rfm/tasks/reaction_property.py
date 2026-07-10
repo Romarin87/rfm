@@ -143,12 +143,17 @@ def masked_batch_view(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]
 
 
 def masked_out_view(out: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    return {
+    masked_out = {
         "delta_bo": out["masked_delta_bo"],
         "changed_logits": out["masked_changed_logits"],
         "edit_logits": out["masked_edit_logits"],
         "core_logits": out["masked_core_logits"],
     }
+    for key in ("router_pair_logits", "router_atom_logits"):
+        prefixed_key = f"masked_{key}"
+        if prefixed_key in out:
+            masked_out[key] = out[prefixed_key]
+    return masked_out
 
 
 def edit_class_weights(args: Any, device: torch.device) -> torch.Tensor:
@@ -293,6 +298,9 @@ def evaluate(model: torch.nn.Module, loader: Any, y_mean: torch.Tensor, y_std: t
     changed_labels, changed_scores = [], []
     edit_labels, edit_preds = [], []
     delta_true, delta_pred = [], []
+    router_pair_labels, router_pair_scores = [], []
+    router_atom_labels, router_atom_scores = [], []
+    router_pair_entropies, router_atom_entropies = [], []
     n_atoms, core_size = [], []
     for batch in loader:
         batch = move_to_device(batch, device)
@@ -311,6 +319,14 @@ def evaluate(model: torch.nn.Module, loader: Any, y_mean: torch.Tensor, y_std: t
         delta_pred.append(masked_out["delta_bo"][target_mask].detach().cpu().numpy())
         core_labels.append(masked_batch["core_atom"][batch["atom_mask"]].detach().cpu().numpy())
         core_scores.append(masked_out["core_logits"][batch["atom_mask"]].detach().cpu().numpy())
+        if "router_pair_logits" in masked_out and "router_atom_logits" in masked_out:
+            router_pair_mask = torch.triu(masked_batch["pair_valid"], diagonal=1)
+            router_pair_labels.append(masked_batch["changed"][router_pair_mask].detach().cpu().numpy())
+            router_pair_scores.append(masked_out["router_pair_logits"][router_pair_mask].detach().cpu().numpy())
+            router_atom_labels.append(masked_batch["core_atom"][batch["atom_mask"]].detach().cpu().numpy())
+            router_atom_scores.append(masked_out["router_atom_logits"][batch["atom_mask"]].detach().cpu().numpy())
+            router_pair_entropies.extend(masked_edit.normalized_router_entropy(masked_out["router_pair_logits"], masked_batch["pair_valid"]))
+            router_atom_entropies.extend(masked_edit.normalized_router_entropy(masked_out["router_atom_logits"], batch["atom_mask"]))
         n_atoms.extend(batch["n_atoms"].detach().cpu().numpy().tolist())
         core_size.extend(batch["core_size"].detach().cpu().numpy().tolist())
 
@@ -338,6 +354,19 @@ def evaluate(model: torch.nn.Module, loader: Any, y_mean: torch.Tensor, y_std: t
             "core_atom_F1": binary_f1(core_y.astype(int), (core_s >= 0.0).astype(int)),
         }
     )
+    if router_pair_scores:
+        router_pair_y = np.concatenate(router_pair_labels)
+        router_pair_s = np.concatenate(router_pair_scores)
+        router_atom_y = np.concatenate(router_atom_labels)
+        router_atom_s = np.concatenate(router_atom_scores)
+        metrics.update(
+            {
+                "router_pair_AUROC": safe_auroc(router_pair_y, router_pair_s),
+                "router_atom_AUROC": safe_auroc(router_atom_y, router_atom_s),
+                "router_pair_normalized_entropy": float(np.mean(router_pair_entropies)),
+                "router_atom_normalized_entropy": float(np.mean(router_atom_entropies)),
+            }
+        )
     metrics["n_atoms_mean"] = float(np.mean(n_atoms))
     metrics["core_size_mean"] = float(np.mean(core_size))
     return metrics

@@ -63,6 +63,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--radar-delta-stream", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--radar-pair-update-scale", type=float, default=0.75)
     parser.add_argument("--radar-reaction-update-scale", type=float, default=1.0)
+    parser.add_argument("--radar-router-gate-init", type=float, default=0.05)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--geometry-mode", choices=("2d", "irc_rp"), default="2d")
     parser.add_argument("--stage-a-weight", type=float, default=0.5)
@@ -312,6 +313,7 @@ def main(argv: list[str] | None = None) -> None:
         radar_delta_stream=args.radar_delta_stream,
         radar_pair_update_scale=args.radar_pair_update_scale,
         radar_reaction_update_scale=args.radar_reaction_update_scale,
+        radar_router_gate_init=args.radar_router_gate_init,
     ).to(device)
     if args.pretrained_stage_a and args.pretrained_encoder:
         raise ValueError("use either --pretrained-stage-a or --pretrained-encoder, not both")
@@ -344,7 +346,13 @@ def main(argv: list[str] | None = None) -> None:
         if is_main(rank):
             valid_loss = suiren_fusion_property.evaluate_loss(model, valid_loader, y_mean, y_std, args, device)
             valid_metrics = suiren_fusion_property.evaluate(model, valid_loader, y_mean, y_std, device)
-            row = {"epoch": epoch, "train": train_metrics, "valid_loss": valid_loss, "valid": valid_metrics}
+            row = {
+                "epoch": epoch,
+                "train": train_metrics,
+                "valid_loss": valid_loss,
+                "valid": valid_metrics,
+                "router_gates": model.masked_edit_heads.router_gate_values(),
+            }
             history.append(row)
             print(json.dumps(row, ensure_ascii=False), flush=True)
             if valid_loss["loss"] < best_valid_loss - args.early_stop_min_delta:
@@ -396,6 +404,7 @@ def main(argv: list[str] | None = None) -> None:
             "early_stopped": early_stopped,
             "early_stop_patience": args.early_stop_patience,
             "early_stop_min_delta": args.early_stop_min_delta,
+            "router_gates": model.masked_edit_heads.router_gate_values(),
             "model_improvement_switches": {
                 "encoder_type": args.encoder_type,
                 "radar_attention_heads": args.radar_attention_heads,
@@ -403,6 +412,7 @@ def main(argv: list[str] | None = None) -> None:
                 "radar_delta_stream": args.radar_delta_stream,
                 "radar_pair_update_scale": args.radar_pair_update_scale,
                 "radar_reaction_update_scale": args.radar_reaction_update_scale,
+                "radar_router_gate_init": args.radar_router_gate_init,
                 "suiren_input_gates": args.enable_suiren_input_gates,
                 "dynamic_pair_update": args.enable_dynamic_pair_update,
                 "dynamic_pair_update_scale": args.dynamic_pair_update_scale,
@@ -456,6 +466,8 @@ def main(argv: list[str] | None = None) -> None:
                     "delta_stream": args.radar_delta_stream,
                     "pair_update_scale": args.radar_pair_update_scale,
                     "reaction_update_scale": args.radar_reaction_update_scale,
+                    "router_gate_init": args.radar_router_gate_init,
+                    "router_residual": args.radar_center_router,
                 },
                 "suiren_input_semantics": {
                     "graph_features": "initial_reaction_token_input_projection",
@@ -496,6 +508,7 @@ def main(argv: list[str] | None = None) -> None:
                     "radar_delta_stream": args.radar_delta_stream,
                     "radar_pair_update_scale": args.radar_pair_update_scale,
                     "radar_reaction_update_scale": args.radar_reaction_update_scale,
+                    "radar_router_gate_init": args.radar_router_gate_init,
                     "suiren_input_gates": args.enable_suiren_input_gates,
                     "dynamic_pair_update": args.enable_dynamic_pair_update,
                     "dynamic_pair_update_scale": args.dynamic_pair_update_scale,

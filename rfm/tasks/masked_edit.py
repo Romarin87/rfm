@@ -97,6 +97,22 @@ def parse_float_list(value: str) -> list[float]:
     return [float(item.strip()) for item in value.split(",") if item.strip()]
 
 
+def normalized_router_entropy(logits: torch.Tensor, mask: torch.Tensor) -> list[float]:
+    """Return per-sample softmax entropy normalized to [0, 1]."""
+
+    logits = logits.reshape(logits.shape[0], -1)
+    mask = mask.reshape(mask.shape[0], -1).bool()
+    entropies: list[float] = []
+    for sample_logits, sample_mask in zip(logits, mask):
+        valid_logits = sample_logits[sample_mask]
+        if valid_logits.numel() <= 1:
+            continue
+        probabilities = torch.softmax(valid_logits.float(), dim=0)
+        entropy = -(probabilities * probabilities.clamp_min(1e-12).log()).sum()
+        entropies.append(float((entropy / np.log(valid_logits.numel())).detach().cpu()))
+    return entropies
+
+
 def compute_loss(
     out: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
@@ -174,6 +190,9 @@ def evaluate(model: torch.nn.Module, loader: Any, device: torch.device, max_pred
     edit_labels, edit_preds = [], []
     delta_true, delta_pred = [], []
     core_labels, core_scores = [], []
+    router_pair_labels, router_pair_scores = [], []
+    router_atom_labels, router_atom_scores = [], []
+    router_pair_entropies, router_atom_entropies = [], []
     rows: list[dict[str, Any]] = []
     for batch in loader:
         batch = move_to_device(batch, device)
@@ -187,6 +206,14 @@ def evaluate(model: torch.nn.Module, loader: Any, device: torch.device, max_pred
         delta_pred.append(out["delta_bo"][mask].detach().cpu().numpy())
         core_labels.append(batch["core_atom"][batch["atom_mask"]].detach().cpu().numpy())
         core_scores.append(out["core_logits"][batch["atom_mask"]].detach().cpu().numpy())
+        if "router_pair_logits" in out and "router_atom_logits" in out:
+            router_pair_mask = torch.triu(batch["pair_valid"], diagonal=1)
+            router_pair_labels.append(batch["changed"][router_pair_mask].detach().cpu().numpy())
+            router_pair_scores.append(out["router_pair_logits"][router_pair_mask].detach().cpu().numpy())
+            router_atom_labels.append(batch["core_atom"][batch["atom_mask"]].detach().cpu().numpy())
+            router_atom_scores.append(out["router_atom_logits"][batch["atom_mask"]].detach().cpu().numpy())
+            router_pair_entropies.extend(normalized_router_entropy(out["router_pair_logits"], batch["pair_valid"]))
+            router_atom_entropies.extend(normalized_router_entropy(out["router_atom_logits"], batch["atom_mask"]))
         if len(rows) < max_prediction_rows:
             probs = torch.sigmoid(out["changed_logits"]).detach().cpu().numpy()
             mask_np = mask.detach().cpu().numpy()
@@ -230,6 +257,19 @@ def evaluate(model: torch.nn.Module, loader: Any, device: torch.device, max_pred
         "core_atom_AUROC": safe_auroc(core_y, core_s),
         "core_atom_F1": binary_f1(core_y.astype(int), (core_s >= 0.0).astype(int)),
     }
+    if router_pair_scores:
+        router_pair_y = np.concatenate(router_pair_labels)
+        router_pair_s = np.concatenate(router_pair_scores)
+        router_atom_y = np.concatenate(router_atom_labels)
+        router_atom_s = np.concatenate(router_atom_scores)
+        metrics.update(
+            {
+                "router_pair_AUROC": safe_auroc(router_pair_y, router_pair_s),
+                "router_atom_AUROC": safe_auroc(router_atom_y, router_atom_s),
+                "router_pair_normalized_entropy": float(np.mean(router_pair_entropies)),
+                "router_atom_normalized_entropy": float(np.mean(router_atom_entropies)),
+            }
+        )
     return metrics, rows
 
 
