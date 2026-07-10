@@ -53,13 +53,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--encoder-type", choices=("token_space", "radar"), default="token_space")
+    parser.add_argument("--encoder-type", choices=("token_space", "radar", "mrto"), default="token_space")
     parser.add_argument("--radar-attention-heads", type=int, default=8)
     parser.add_argument("--radar-center-router", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--radar-delta-stream", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--radar-pair-update-scale", type=float, default=0.75)
     parser.add_argument("--radar-reaction-update-scale", type=float, default=1.0)
     parser.add_argument("--radar-router-gate-init", type=float, default=0.05)
+    parser.add_argument("--mrto-attention-heads", type=int, default=8)
+    parser.add_argument("--mrto-event-slots", type=int, default=4)
+    parser.add_argument("--mrto-use-event-slots", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mrto-use-odd-field", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mrto-pair-update-scale", type=float, default=1.0)
+    parser.add_argument("--mrto-reaction-update-scale", type=float, default=1.0)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--geometry-mode", choices=("2d", "irc_rp"), default="2d")
     parser.add_argument("--stage-a-weight", type=float, default=0.5)
@@ -139,14 +145,20 @@ def main(argv: list[str] | None = None) -> None:
         radar_pair_update_scale=args.radar_pair_update_scale,
         radar_reaction_update_scale=args.radar_reaction_update_scale,
         radar_router_gate_init=args.radar_router_gate_init,
+        mrto_attention_heads=args.mrto_attention_heads,
+        mrto_event_slots=args.mrto_event_slots,
+        mrto_use_event_slots=args.mrto_use_event_slots,
+        mrto_use_odd_field=args.mrto_use_odd_field,
+        mrto_pair_update_scale=args.mrto_pair_update_scale,
+        mrto_reaction_update_scale=args.mrto_reaction_update_scale,
     ).to(device)
     if args.pretrained_stage_a and args.pretrained_encoder:
         raise ValueError("use either --pretrained-stage-a or --pretrained-encoder, not both")
     if args.pretrained_stage_a:
         load_stage_a_checkpoint(model, args.pretrained_stage_a, device)
     elif args.pretrained_encoder:
-        if args.encoder_type == "radar":
-            raise ValueError("RADAR Stage B requires --pretrained-stage-a so the adapter and edit heads are restored")
+        if args.encoder_type in {"radar", "mrto"}:
+            raise ValueError(f"{args.encoder_type} Stage B requires --pretrained-stage-a so the adapter and edit heads are restored")
         load_pretrained_encoder(model, args.pretrained_encoder, device)
     if args.freeze_encoder:
         for param in model.encoder.parameters():
@@ -284,6 +296,15 @@ def main(argv: list[str] | None = None) -> None:
                     "reaction_update_scale": args.radar_reaction_update_scale,
                     "router_gate_init": args.radar_router_gate_init,
                     "router_residual": args.radar_center_router,
+                },
+                "mrto": {
+                    "attention_heads": args.mrto_attention_heads,
+                    "event_slots": args.mrto_event_slots,
+                    "use_event_slots": args.mrto_use_event_slots,
+                    "use_odd_field": args.mrto_use_odd_field,
+                    "pair_update_scale": args.mrto_pair_update_scale,
+                    "reaction_update_scale": args.mrto_reaction_update_scale,
+                    "router_residual": args.encoder_type == "mrto",
                 },
                 "loss": {
                     "stage_a_weight": args.stage_a_weight,

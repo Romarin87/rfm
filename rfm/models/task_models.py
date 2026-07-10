@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from rfm.data.reaction_samples import EDIT_CLASSES, ENERGY_TARGETS
+from rfm.features.mrto import MRTOReactionEncoder, MRTOReactionInputAdapter
 from rfm.features.radar import RADARReactionEncoder, RADARReactionInputAdapter
 from rfm.features.token_space import MaskedEditAdapter, RPairPropertyAdapter, TokenSpaceReactionEncoder, UnifiedReactionInputAdapter
 
@@ -90,12 +91,23 @@ class MaskedEditHeads(nn.Module):
         return out
 
 
+def _router_logits(encoded: dict[str, torch.Tensor]) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    atom_logits = encoded.get("radar_center_atom_logits")
+    pair_logits = encoded.get("radar_center_pair_logits")
+    if atom_logits is None:
+        atom_logits = encoded.get("mrto_center_atom_logits")
+    if pair_logits is None:
+        pair_logits = encoded.get("mrto_center_pair_logits")
+    return atom_logits, pair_logits
+
+
 def _masked_edit_outputs(heads: MaskedEditHeads, encoded: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    router_atom_logits, router_pair_logits = _router_logits(encoded)
     return heads(
         encoded["atom_h"],
         encoded["pair_h"],
-        router_atom_logits=encoded.get("radar_center_atom_logits"),
-        router_pair_logits=encoded.get("radar_center_pair_logits"),
+        router_atom_logits=router_atom_logits,
+        router_pair_logits=router_pair_logits,
     )
 
 
@@ -119,10 +131,34 @@ class MaskedEditPretrainingModel(nn.Module):
         radar_pair_update_scale: float = 0.75,
         radar_reaction_update_scale: float = 1.0,
         radar_router_gate_init: float = 0.05,
+        mrto_attention_heads: int = 8,
+        mrto_event_slots: int = 4,
+        mrto_use_event_slots: bool = True,
+        mrto_use_odd_field: bool = True,
+        mrto_pair_update_scale: float = 1.0,
+        mrto_reaction_update_scale: float = 1.0,
     ):
         super().__init__()
         self.encoder_type = encoder_type
-        if encoder_type == "radar":
+        if encoder_type == "mrto":
+            self.adapter = MRTOReactionInputAdapter(
+                hidden_dim=hidden_dim,
+                pair_input_dim=pair_raw_dim,
+                input_schema=input_schema,
+                task_name="masked_edit",
+                use_odd_field=mrto_use_odd_field,
+            )
+            self.encoder = MRTOReactionEncoder(
+                hidden_dim=hidden_dim,
+                layers=layers,
+                dropout=dropout,
+                attention_heads=mrto_attention_heads,
+                event_slots=mrto_event_slots,
+                use_event_slots=mrto_use_event_slots,
+                pair_update_scale=mrto_pair_update_scale,
+                reaction_update_scale=mrto_reaction_update_scale,
+            )
+        elif encoder_type == "radar":
             self.adapter = RADARReactionInputAdapter(
                 hidden_dim=hidden_dim,
                 pair_input_dim=pair_raw_dim,
@@ -157,7 +193,7 @@ class MaskedEditPretrainingModel(nn.Module):
             raise ValueError(f"unsupported encoder_type={encoder_type!r}")
         self.masked_edit_heads = MaskedEditHeads(
             hidden_dim,
-            router_residual=encoder_type == "radar" and radar_center_router,
+            router_residual=(encoder_type == "radar" and radar_center_router) or encoder_type == "mrto",
             router_gate_init=radar_router_gate_init,
         )
 
@@ -195,11 +231,44 @@ class ReactionPropertyRegressor(nn.Module):
         radar_pair_update_scale: float = 0.75,
         radar_reaction_update_scale: float = 1.0,
         radar_router_gate_init: float = 0.05,
+        mrto_attention_heads: int = 8,
+        mrto_event_slots: int = 4,
+        mrto_use_event_slots: bool = True,
+        mrto_use_odd_field: bool = True,
+        mrto_pair_update_scale: float = 1.0,
+        mrto_reaction_update_scale: float = 1.0,
     ):
         super().__init__()
         masked_schema, masked_pair_raw_dim = _masked_edit_schema_for_property(input_schema)
         self.encoder_type = encoder_type
-        if encoder_type == "radar":
+        if encoder_type == "mrto":
+            if directional_3d_adapter:
+                raise ValueError("directional_3d_adapter is only supported by encoder_type='token_space'")
+            self.adapter = MRTOReactionInputAdapter(
+                hidden_dim=hidden_dim,
+                pair_input_dim=pair_raw_dim,
+                input_schema=input_schema,
+                task_name="property",
+                use_odd_field=mrto_use_odd_field,
+            )
+            self.masked_adapter = MRTOReactionInputAdapter(
+                hidden_dim=hidden_dim,
+                pair_input_dim=masked_pair_raw_dim,
+                input_schema=masked_schema,
+                task_name="masked_edit",
+                use_odd_field=mrto_use_odd_field,
+            )
+            self.encoder = MRTOReactionEncoder(
+                hidden_dim=hidden_dim,
+                layers=layers,
+                dropout=dropout,
+                attention_heads=mrto_attention_heads,
+                event_slots=mrto_event_slots,
+                use_event_slots=mrto_use_event_slots,
+                pair_update_scale=mrto_pair_update_scale,
+                reaction_update_scale=mrto_reaction_update_scale,
+            )
+        elif encoder_type == "radar":
             if directional_3d_adapter:
                 raise ValueError("directional_3d_adapter is only supported by encoder_type='token_space'")
             self.adapter = RADARReactionInputAdapter(
@@ -249,7 +318,7 @@ class ReactionPropertyRegressor(nn.Module):
             raise ValueError(f"unsupported encoder_type={encoder_type!r}")
         self.masked_edit_heads = MaskedEditHeads(
             hidden_dim,
-            router_residual=encoder_type == "radar" and radar_center_router,
+            router_residual=(encoder_type == "radar" and radar_center_router) or encoder_type == "mrto",
             router_gate_init=radar_router_gate_init,
         )
         self.atom_readout = AtomAttentionReadout(hidden_dim) if attention_readout else None

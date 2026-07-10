@@ -51,13 +51,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--encoder-type", choices=("token_space", "radar"), default="token_space")
+    parser.add_argument("--encoder-type", choices=("token_space", "radar", "mrto"), default="token_space")
     parser.add_argument("--radar-attention-heads", type=int, default=8)
     parser.add_argument("--radar-center-router", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--radar-delta-stream", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--radar-pair-update-scale", type=float, default=0.75)
     parser.add_argument("--radar-reaction-update-scale", type=float, default=1.0)
     parser.add_argument("--radar-router-gate-init", type=float, default=0.05)
+    parser.add_argument("--mrto-attention-heads", type=int, default=8)
+    parser.add_argument("--mrto-event-slots", type=int, default=4)
+    parser.add_argument("--mrto-use-event-slots", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mrto-use-odd-field", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mrto-pair-update-scale", type=float, default=1.0)
+    parser.add_argument("--mrto-reaction-update-scale", type=float, default=1.0)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--geometry-mode", choices=("2d", "irc_rp"), default="2d")
     parser.add_argument("--mask-strategy", choices=("reaction_center", "changed_enriched", "random_pair"), default="reaction_center")
@@ -138,6 +144,12 @@ def main(argv: list[str] | None = None) -> None:
         radar_pair_update_scale=args.radar_pair_update_scale,
         radar_reaction_update_scale=args.radar_reaction_update_scale,
         radar_router_gate_init=args.radar_router_gate_init,
+        mrto_attention_heads=args.mrto_attention_heads,
+        mrto_event_slots=args.mrto_event_slots,
+        mrto_use_event_slots=args.mrto_use_event_slots,
+        mrto_use_odd_field=args.mrto_use_odd_field,
+        mrto_pair_update_scale=args.mrto_pair_update_scale,
+        mrto_reaction_update_scale=args.mrto_reaction_update_scale,
     ).to(device)
     train_model: nn.Module = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False) if ddp_enabled() and device.type == "cuda" else model
     optimizer = build_optimizer(train_model.named_parameters(), args)
@@ -260,6 +272,15 @@ def main(argv: list[str] | None = None) -> None:
                     "reaction_update_scale": args.radar_reaction_update_scale,
                     "router_gate_init": args.radar_router_gate_init,
                     "router_residual": args.radar_center_router,
+                },
+                "mrto": {
+                    "attention_heads": args.mrto_attention_heads,
+                    "event_slots": args.mrto_event_slots,
+                    "use_event_slots": args.mrto_use_event_slots,
+                    "use_odd_field": args.mrto_use_odd_field,
+                    "pair_update_scale": args.mrto_pair_update_scale,
+                    "reaction_update_scale": args.mrto_reaction_update_scale,
+                    "router_residual": args.encoder_type == "mrto",
                 },
                 "mask_strategy": args.mask_strategy,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
