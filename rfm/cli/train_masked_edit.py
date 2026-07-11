@@ -51,7 +51,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--encoder-type", choices=("token_space", "radar", "mrto"), default="token_space")
+    parser.add_argument("--encoder-type", choices=("token_space", "radar", "mrto", "mrto_v1"), default="token_space")
     parser.add_argument("--radar-attention-heads", type=int, default=8)
     parser.add_argument("--radar-center-router", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--radar-delta-stream", action=argparse.BooleanOptionalAction, default=True)
@@ -64,6 +64,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mrto-use-odd-field", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mrto-pair-update-scale", type=float, default=1.0)
     parser.add_argument("--mrto-reaction-update-scale", type=float, default=1.0)
+    parser.add_argument("--mrto-endpoint-layers", type=int, default=2)
+    parser.add_argument("--mrto-triangle-layers", type=int, default=2)
+    parser.add_argument("--mrto-triangle-dim", type=int, default=16)
+    parser.add_argument("--mrto-triangle-scale", type=float, default=0.5)
+    parser.add_argument("--mrto-event-topk", type=int, default=0)
+    parser.add_argument("--mrto-event-feedback-scale", type=float, default=0.5)
+    parser.add_argument("--mrto-geometry-rbf-bins", type=int, default=16)
+    parser.add_argument("--mrto-event-set-weight", type=float, default=0.0)
+    parser.add_argument("--mrto-event-diversity-weight", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--geometry-mode", choices=("2d", "irc_rp"), default="2d")
     parser.add_argument("--mask-strategy", choices=("reaction_center", "changed_enriched", "random_pair"), default="reaction_center")
@@ -150,6 +159,13 @@ def main(argv: list[str] | None = None) -> None:
         mrto_use_odd_field=args.mrto_use_odd_field,
         mrto_pair_update_scale=args.mrto_pair_update_scale,
         mrto_reaction_update_scale=args.mrto_reaction_update_scale,
+        mrto_endpoint_layers=args.mrto_endpoint_layers,
+        mrto_triangle_layers=args.mrto_triangle_layers,
+        mrto_triangle_dim=args.mrto_triangle_dim,
+        mrto_triangle_scale=args.mrto_triangle_scale,
+        mrto_event_topk=args.mrto_event_topk,
+        mrto_event_feedback_scale=args.mrto_event_feedback_scale,
+        mrto_geometry_rbf_bins=args.mrto_geometry_rbf_bins,
     ).to(device)
     train_model: nn.Module = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False) if ddp_enabled() and device.type == "cuda" else model
     optimizer = build_optimizer(train_model.named_parameters(), args)
@@ -280,7 +296,16 @@ def main(argv: list[str] | None = None) -> None:
                     "use_odd_field": args.mrto_use_odd_field,
                     "pair_update_scale": args.mrto_pair_update_scale,
                     "reaction_update_scale": args.mrto_reaction_update_scale,
-                    "router_residual": args.encoder_type == "mrto",
+                    "endpoint_layers": args.mrto_endpoint_layers,
+                    "triangle_layers": args.mrto_triangle_layers,
+                    "triangle_dim": args.mrto_triangle_dim,
+                    "triangle_scale": args.mrto_triangle_scale,
+                    "event_topk": args.mrto_event_topk,
+                    "event_feedback_scale": args.mrto_event_feedback_scale,
+                    "geometry_rbf_bins": args.mrto_geometry_rbf_bins,
+                    "event_set_weight": args.mrto_event_set_weight,
+                    "event_diversity_weight": args.mrto_event_diversity_weight,
+                    "router_residual": args.encoder_type in {"mrto", "mrto_v1"},
                 },
                 "mask_strategy": args.mask_strategy,
                 "generated_at": datetime.now(timezone.utc).isoformat(),

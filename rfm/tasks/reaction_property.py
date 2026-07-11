@@ -153,6 +153,8 @@ def masked_out_view(out: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         prefixed_key = f"masked_{key}"
         if prefixed_key in out:
             masked_out[key] = out[prefixed_key]
+    if "masked_mrto_event_pair_weights" in out:
+        masked_out["mrto_event_pair_weights"] = out["masked_mrto_event_pair_weights"]
     return masked_out
 
 
@@ -244,6 +246,8 @@ def train_one_epoch(
         "changed_loss": 0.0,
         "edit_loss": 0.0,
         "core_loss": 0.0,
+        "event_set_loss": 0.0,
+        "event_diversity_loss": 0.0,
         "n": 0.0,
     }
     for batch in loader:
@@ -275,6 +279,8 @@ def evaluate_loss(model: torch.nn.Module, loader: Any, y_mean: torch.Tensor, y_s
         "changed_loss": 0.0,
         "edit_loss": 0.0,
         "core_loss": 0.0,
+        "event_set_loss": 0.0,
+        "event_diversity_loss": 0.0,
         "n": 0.0,
     }
     for batch in loader:

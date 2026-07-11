@@ -113,6 +113,52 @@ def normalized_router_entropy(logits: torch.Tensor, mask: torch.Tensor) -> list[
     return entropies
 
 
+def event_set_losses(
+    event_pair_weights: torch.Tensor | None,
+    batch: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Permutation-invariant changed-pair coverage and slot diversity losses."""
+
+    if event_pair_weights is None:
+        zero = batch["delta_bo"].new_zeros(())
+        return zero, zero
+    if event_pair_weights.ndim != 4:
+        raise ValueError(
+            "mrto_event_pair_weights must be [B,K,N,N], "
+            f"got {tuple(event_pair_weights.shape)}"
+        )
+    upper_valid = torch.triu(batch["pair_valid"].bool(), diagonal=1)
+    changed = (batch["changed"] > 0.5) & upper_valid
+    set_terms: list[torch.Tensor] = []
+    diversity_terms: list[torch.Tensor] = []
+    for sample_weights, sample_changed, sample_valid in zip(
+        event_pair_weights,
+        changed,
+        upper_valid,
+    ):
+        valid_weights = sample_weights[:, sample_valid]
+        target = sample_changed[sample_valid]
+        if valid_weights.shape[1] == 0 or not bool(target.any()):
+            continue
+        valid_weights = valid_weights / valid_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        target_weights = valid_weights[:, target].clamp_min(1e-8)
+        target_cost = -target_weights.log()
+        target_to_slot = target_cost.min(dim=0).values.mean()
+        slot_to_target = target_cost.min(dim=1).values.mean()
+        set_terms.append(0.5 * (target_to_slot + slot_to_target))
+
+        normalized = valid_weights / valid_weights.square().sum(dim=1, keepdim=True).sqrt().clamp_min(1e-8)
+        similarity = normalized @ normalized.transpose(0, 1)
+        slots = similarity.shape[0]
+        if slots > 1:
+            off_diagonal = ~torch.eye(slots, dtype=torch.bool, device=similarity.device)
+            diversity_terms.append(similarity[off_diagonal].mean())
+    zero = event_pair_weights.new_zeros(())
+    set_loss = torch.stack(set_terms).mean() if set_terms else zero
+    diversity_loss = torch.stack(diversity_terms).mean() if diversity_terms else zero
+    return set_loss, diversity_loss
+
+
 def compute_loss(
     out: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
@@ -124,12 +170,22 @@ def compute_loss(
     changed_loss = F.binary_cross_entropy_with_logits(out["changed_logits"][mask], batch["changed"][mask])
     edit_loss = F.cross_entropy(out["edit_logits"][mask], batch["edit_class"][mask], weight=edit_class_weights)
     core_loss = F.binary_cross_entropy_with_logits(out["core_logits"][batch["atom_mask"]], batch["core_atom"][batch["atom_mask"]])
-    loss = args.delta_bo_weight * delta_loss + args.changed_weight * changed_loss + args.edit_weight * edit_loss + args.core_weight * core_loss
+    event_set_loss, event_diversity_loss = event_set_losses(out.get("mrto_event_pair_weights"), batch)
+    loss = (
+        args.delta_bo_weight * delta_loss
+        + args.changed_weight * changed_loss
+        + args.edit_weight * edit_loss
+        + args.core_weight * core_loss
+        + float(getattr(args, "mrto_event_set_weight", 0.0)) * event_set_loss
+        + float(getattr(args, "mrto_event_diversity_weight", 0.0)) * event_diversity_loss
+    )
     return loss, {
         "delta_bo_loss": float(delta_loss.detach().cpu()),
         "changed_loss": float(changed_loss.detach().cpu()),
         "edit_loss": float(edit_loss.detach().cpu()),
         "core_loss": float(core_loss.detach().cpu()),
+        "event_set_loss": float(event_set_loss.detach().cpu()),
+        "event_diversity_loss": float(event_diversity_loss.detach().cpu()),
     }
 
 
@@ -142,7 +198,16 @@ def train_one_epoch(
     edit_class_weights: torch.Tensor,
 ) -> dict[str, float]:
     model.train()
-    totals = {"loss": 0.0, "delta_bo_loss": 0.0, "changed_loss": 0.0, "edit_loss": 0.0, "core_loss": 0.0, "n": 0.0}
+    totals = {
+        "loss": 0.0,
+        "delta_bo_loss": 0.0,
+        "changed_loss": 0.0,
+        "edit_loss": 0.0,
+        "core_loss": 0.0,
+        "event_set_loss": 0.0,
+        "event_diversity_loss": 0.0,
+        "n": 0.0,
+    }
     for batch in loader:
         batch = move_to_device(batch, device)
         out = model(batch)
@@ -169,7 +234,16 @@ def evaluate_loss(
     edit_class_weights: torch.Tensor,
 ) -> dict[str, float]:
     model.eval()
-    totals = {"loss": 0.0, "delta_bo_loss": 0.0, "changed_loss": 0.0, "edit_loss": 0.0, "core_loss": 0.0, "n": 0.0}
+    totals = {
+        "loss": 0.0,
+        "delta_bo_loss": 0.0,
+        "changed_loss": 0.0,
+        "edit_loss": 0.0,
+        "core_loss": 0.0,
+        "event_set_loss": 0.0,
+        "event_diversity_loss": 0.0,
+        "n": 0.0,
+    }
     for batch in loader:
         batch = move_to_device(batch, device)
         out = model(batch)
