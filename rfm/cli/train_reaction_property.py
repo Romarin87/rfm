@@ -48,6 +48,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-dim", type=int, default=128)
@@ -346,6 +347,7 @@ def main(argv: list[str] | None = None) -> None:
                     "pair_mask_ratio": args.pair_mask_ratio,
                     "changed_pair_mask_ratio": args.changed_pair_mask_ratio,
                 },
+                "effective_batch_size_per_process": args.batch_size * args.gradient_accumulation_steps,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             },
         )

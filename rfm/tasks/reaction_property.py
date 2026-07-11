@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -250,14 +251,26 @@ def train_one_epoch(
         "event_diversity_loss": 0.0,
         "n": 0.0,
     }
-    for batch in loader:
+    accumulation_steps = max(int(getattr(args, "gradient_accumulation_steps", 1)), 1)
+    final_group = len(loader) % accumulation_steps
+    optimizer.zero_grad(set_to_none=True)
+    for step, batch in enumerate(loader):
         batch = move_to_device(batch, device)
-        out = model(batch)
-        loss, parts = compute_loss(out, batch, y_mean, y_std, args)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
+        should_step = (step + 1) % accumulation_steps == 0 or (step + 1) == len(loader)
+        group_size = (
+            final_group
+            if final_group and step >= len(loader) - final_group
+            else accumulation_steps
+        )
+        sync_context = model.no_sync() if hasattr(model, "no_sync") and not should_step else nullcontext()
+        with sync_context:
+            out = model(batch)
+            loss, parts = compute_loss(out, batch, y_mean, y_std, args)
+            (loss / group_size).backward()
+        if should_step:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
         batch_size = batch["y"].shape[0]
         totals["loss"] += float(loss.detach().cpu()) * batch_size
         for key, value in parts.items():
