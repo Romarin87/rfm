@@ -279,6 +279,12 @@ class SuirenFusionPropertyDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    @property
+    def atom_counts(self) -> np.ndarray:
+        if hasattr(self.samples, "n_atoms_array"):
+            return self.samples.n_atoms_array()  # type: ignore[attr-defined]
+        return np.asarray([len(sample["atomic_numbers"]) for sample in self.samples], dtype=np.int32)
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         sample = self.samples[idx]
         pair = reaction_property_pair_input(sample, self.args)

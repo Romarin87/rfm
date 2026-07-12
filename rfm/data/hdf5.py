@@ -158,6 +158,13 @@ class Hdf5ReactionDeltaSampleStore(Sequence[dict[str, Any]]):
                 return np.asarray(self._targets[self.start : self.stop, cols], dtype=np.float32)
         return np.asarray([[float(self[idx]["targets"][name]) for name in targets] for idx in range(len(self))], dtype=np.float32)
 
+    def n_atoms_array(self) -> np.ndarray:
+        """Read atom counts without decoding the per-row JSON payload."""
+
+        with h5py.File(self.path, "r") as h5:
+            group = h5["splits"][self.split]
+            return np.asarray(group["n_atoms"][self.start : self.stop], dtype=np.int32)
+
     def close(self) -> None:
         if self._h5 is not None:
             self._h5.close()

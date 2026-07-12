@@ -16,6 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
+from rfm.data.sampling import AtomCountBatchSampler
 from rfm.models import ReactionPropertyRegressor, load_pretrained_encoder, load_stage_a_checkpoint
 from rfm.optim import build_optimizer
 from rfm.tasks import reaction_property
@@ -49,6 +50,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--train-batching", choices=("random", "atom_count_bucket"), default="random")
+    parser.add_argument("--log-every-steps", type=int, default=0)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-dim", type=int, default=128)
@@ -125,16 +128,32 @@ def main(argv: list[str] | None = None) -> None:
     train_ds = reaction_property.ReactionPropertyDataset(args.train, args.max_train, args)
     valid_ds = reaction_property.ReactionPropertyDataset(args.valid, args.max_valid, args)
     test_ds = reaction_property.ReactionPropertyDataset(args.test, args.max_test, args)
-    train_sampler = DistributedSampler(train_ds, shuffle=True, seed=args.seed) if ddp_enabled() else None
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
-        collate_fn=reaction_property.collate,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
+    if args.train_batching == "atom_count_bucket":
+        train_sampler = AtomCountBatchSampler(
+            train_ds.atom_counts,
+            args.batch_size,
+            seed=args.seed,
+            num_replicas=world,
+            rank=rank,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_sampler=train_sampler,
+            collate_fn=reaction_property.collate,
+            num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+    else:
+        train_sampler = DistributedSampler(train_ds, shuffle=True, seed=args.seed) if ddp_enabled() else None
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+            collate_fn=reaction_property.collate,
+            num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
     valid_loader = DataLoader(valid_ds, batch_size=args.batch_size, shuffle=False, collate_fn=reaction_property.collate, num_workers=args.num_workers, pin_memory=torch.cuda.is_available())
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, collate_fn=reaction_property.collate, num_workers=args.num_workers, pin_memory=torch.cuda.is_available())
 
@@ -195,7 +214,16 @@ def main(argv: list[str] | None = None) -> None:
     for epoch in range(args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        train_metrics = reaction_property.train_one_epoch(train_model, train_loader, optimizer, y_mean, y_std, args, device)
+        train_metrics = reaction_property.train_one_epoch(
+            train_model,
+            train_loader,
+            optimizer,
+            y_mean,
+            y_std,
+            args,
+            device,
+            epoch=epoch,
+        )
         stop_now = False
         if is_main(rank):
             valid_loss = reaction_property.evaluate_loss(model, valid_loader, y_mean, y_std, args, device)
@@ -348,6 +376,8 @@ def main(argv: list[str] | None = None) -> None:
                     "changed_pair_mask_ratio": args.changed_pair_mask_ratio,
                 },
                 "effective_batch_size_per_process": args.batch_size * args.gradient_accumulation_steps,
+                "global_effective_batch_size": args.batch_size * args.gradient_accumulation_steps * world,
+                "train_batching": args.train_batching,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             },
         )

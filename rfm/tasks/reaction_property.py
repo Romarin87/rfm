@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,12 @@ class ReactionPropertyDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    @property
+    def atom_counts(self) -> np.ndarray:
+        if hasattr(self.samples, "n_atoms_array"):
+            return self.samples.n_atoms_array()  # type: ignore[attr-defined]
+        return np.asarray([len(sample["atomic_numbers"]) for sample in self.samples], dtype=np.int32)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         sample = self.samples[idx]
@@ -236,6 +244,7 @@ def train_one_epoch(
     y_std: torch.Tensor,
     args: Any,
     device: torch.device,
+    epoch: int = -1,
 ) -> dict[str, float]:
     model.train()
     totals = {
@@ -252,6 +261,9 @@ def train_one_epoch(
         "n": 0.0,
     }
     accumulation_steps = max(int(getattr(args, "gradient_accumulation_steps", 1)), 1)
+    log_every_steps = max(int(getattr(args, "log_every_steps", 0)), 0)
+    log_rank = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    started_at = time.perf_counter()
     final_group = len(loader) % accumulation_steps
     optimizer.zero_grad(set_to_none=True)
     for step, batch in enumerate(loader):
@@ -276,6 +288,24 @@ def train_one_epoch(
         for key, value in parts.items():
             totals[key] += value * batch_size
         totals["n"] += batch_size
+        if log_rank and log_every_steps and ((step + 1) % log_every_steps == 0 or (step + 1) == len(loader)):
+            elapsed = time.perf_counter() - started_at
+            print(
+                json.dumps(
+                    {
+                        "event": "train_progress",
+                        "epoch": int(epoch),
+                        "step": step + 1,
+                        "steps": len(loader),
+                        "samples": int(totals["n"]),
+                        "mean_loss": totals["loss"] / max(totals["n"], 1.0),
+                        "elapsed_seconds": elapsed,
+                        "steps_per_second": (step + 1) / max(elapsed, 1e-6),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
     n = max(totals.pop("n"), 1.0)
     return {key: value / n for key, value in totals.items()}
 

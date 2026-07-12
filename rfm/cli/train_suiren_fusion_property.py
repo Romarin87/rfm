@@ -16,6 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
+from rfm.data.sampling import AtomCountBatchSampler
 from rfm.models import SuirenFusionPropertyRegressor, load_pretrained_encoder, load_stage_a_checkpoint
 from rfm.optim import build_optimizer
 from rfm.tasks import suiren_fusion_property
@@ -53,6 +54,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--train-batching", choices=("random", "atom_count_bucket"), default="random")
+    parser.add_argument("--log-every-steps", type=int, default=0)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-dim", type=int, default=128)
@@ -272,7 +275,23 @@ def main(argv: list[str] | None = None) -> None:
     if train_ds.suiren_atom_dims != valid_ds.suiren_atom_dims or train_ds.suiren_atom_dims != test_ds.suiren_atom_dims:
         raise ValueError("Suiren atom feature dimensions differ across splits")
 
-    if ddp_enabled() and args.forward_reverse_consistency_weight > 0.0:
+    if args.train_batching == "atom_count_bucket" and args.forward_reverse_consistency_weight > 0.0:
+        raise ValueError("atom-count bucketing is incompatible with adjacent forward/reverse consistency batches")
+    if args.train_batching == "atom_count_bucket":
+        train_sampler = AtomCountBatchSampler(
+            train_ds.atom_counts,
+            args.batch_size,
+            seed=args.seed,
+            num_replicas=world,
+            rank=rank,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_sampler=train_sampler,
+            collate_fn=suiren_fusion_property.collate,
+            **data_loader_kwargs(args),
+        )
+    elif ddp_enabled() and args.forward_reverse_consistency_weight > 0.0:
         if args.batch_size % 2:
             raise ValueError("forward/reverse consistency training requires an even per-rank --batch-size")
         train_sampler = DistributedInterleavedForwardReverseSampler(len(train_ds), args.seed, world, rank)
@@ -282,14 +301,15 @@ def main(argv: list[str] | None = None) -> None:
         train_sampler = InterleavedForwardReverseSampler(len(train_ds), args.seed)
     else:
         train_sampler = None
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
-        collate_fn=suiren_fusion_property.collate,
-        **data_loader_kwargs(args),
-    )
+    if args.train_batching != "atom_count_bucket":
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+            collate_fn=suiren_fusion_property.collate,
+            **data_loader_kwargs(args),
+        )
     valid_loader = DataLoader(
         valid_ds,
         batch_size=args.batch_size,
@@ -370,7 +390,16 @@ def main(argv: list[str] | None = None) -> None:
     for epoch in range(args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        train_metrics = suiren_fusion_property.train_one_epoch(train_model, train_loader, optimizer, y_mean, y_std, args, device)
+        train_metrics = suiren_fusion_property.train_one_epoch(
+            train_model,
+            train_loader,
+            optimizer,
+            y_mean,
+            y_std,
+            args,
+            device,
+            epoch=epoch,
+        )
         stop_now = False
         if is_main(rank):
             valid_loss = suiren_fusion_property.evaluate_loss(model, valid_loader, y_mean, y_std, args, device)
@@ -558,6 +587,8 @@ def main(argv: list[str] | None = None) -> None:
                     "prefetch_factor": args.prefetch_factor if args.num_workers > 0 else None,
                 },
                 "effective_batch_size_per_process": args.batch_size * args.gradient_accumulation_steps,
+                "global_effective_batch_size": args.batch_size * args.gradient_accumulation_steps * world,
+                "train_batching": args.train_batching,
                 "model_improvement_switches": {
                     "encoder_type": args.encoder_type,
                     "radar_attention_heads": args.radar_attention_heads,
