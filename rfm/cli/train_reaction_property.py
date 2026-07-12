@@ -52,6 +52,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--train-batching", choices=("random", "atom_count_bucket"), default="random")
     parser.add_argument("--log-every-steps", type=int, default=0)
+    parser.add_argument("--joint-encoder-pass", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-dim", type=int, default=128)
@@ -187,13 +188,14 @@ def main(argv: list[str] | None = None) -> None:
         mrto_event_topk=args.mrto_event_topk,
         mrto_event_feedback_scale=args.mrto_event_feedback_scale,
         mrto_geometry_rbf_bins=args.mrto_geometry_rbf_bins,
+        joint_encoder_pass=args.joint_encoder_pass,
     ).to(device)
     if args.pretrained_stage_a and args.pretrained_encoder:
         raise ValueError("use either --pretrained-stage-a or --pretrained-encoder, not both")
     if args.pretrained_stage_a:
         load_stage_a_checkpoint(model, args.pretrained_stage_a, device)
     elif args.pretrained_encoder:
-        if args.encoder_type in {"radar", "mrto"}:
+        if args.encoder_type in {"radar", "mrto", "mrto_v1"}:
             raise ValueError(f"{args.encoder_type} Stage B requires --pretrained-stage-a so the adapter and edit heads are restored")
         load_pretrained_encoder(model, args.pretrained_encoder, device)
     if args.freeze_encoder:
@@ -378,6 +380,7 @@ def main(argv: list[str] | None = None) -> None:
                 "effective_batch_size_per_process": args.batch_size * args.gradient_accumulation_steps,
                 "global_effective_batch_size": args.batch_size * args.gradient_accumulation_steps * world,
                 "train_batching": args.train_batching,
+                "joint_encoder_pass": args.joint_encoder_pass,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             },
         )

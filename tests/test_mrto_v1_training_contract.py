@@ -71,6 +71,21 @@ def add_suiren_features(batch: dict[str, torch.Tensor], state_dim: int = 4) -> N
     )
 
 
+def add_masked_edit_view(batch: dict[str, torch.Tensor]) -> None:
+    bo_r = batch["pair_input"][..., 0]
+    bo_p = batch["pair_input"][..., 1]
+    d_r_normalized = (batch["pair_input"][..., 2] / 10.0).clamp(0.0, 1.0)
+    delta = bo_p - bo_r
+    visibility = torch.ones_like(delta)
+    visibility[:, 0, 1] = 0.0
+    visibility[:, 1, 0] = 0.0
+    batch["masked_pair_input"] = torch.stack(
+        [bo_r, d_r_normalized, delta * visibility, visibility],
+        dim=-1,
+    )
+    batch["masked_pair_valid"] = batch["pair_valid"].clone()
+
+
 def masked_batch() -> dict[str, torch.Tensor]:
     batch_size, n_atoms = 2, 5
     valid = pair_mask(batch_size, n_atoms)
@@ -320,6 +335,67 @@ class MRTOv1TrainingContractTest(unittest.TestCase):
         self.assertEqual(tuple(output["y"].shape), (2, 2))
         self.assertEqual(tuple(output["reaction_h"].shape), (2, 32))
         self.assertEqual(tuple(output["mrto_event_pair_weights"].shape), (2, 3, 5, 5))
+
+    def test_joint_encoder_pass_matches_two_sequential_passes(self) -> None:
+        kwargs = {
+            "encoder_type": "mrto_v1",
+            "mrto_attention_heads": 4,
+            "mrto_event_slots": 3,
+            "mrto_endpoint_layers": 1,
+            "mrto_triangle_layers": 1,
+            "mrto_triangle_dim": 8,
+        }
+        sequential = ReactionPropertyRegressor(4, 32, 2, 0.0, "property_irc_rp_bo", **kwargs).eval()
+        joint = ReactionPropertyRegressor(
+            4,
+            32,
+            2,
+            0.0,
+            "property_irc_rp_bo",
+            joint_encoder_pass=True,
+            **kwargs,
+        ).eval()
+        joint.load_state_dict(sequential.state_dict())
+        batch = property_batch(geometry=True)
+        add_masked_edit_view(batch)
+        with torch.no_grad():
+            expected = sequential(batch)
+            actual = joint(batch)
+        self.assertEqual(expected.keys(), actual.keys())
+        for key in expected:
+            torch.testing.assert_close(expected[key], actual[key], atol=3e-5, rtol=3e-5)
+
+    def test_suiren_joint_encoder_pass_matches_two_sequential_passes(self) -> None:
+        kwargs = {
+            "encoder_type": "mrto_v1",
+            "mrto_attention_heads": 4,
+            "mrto_event_slots": 3,
+            "mrto_endpoint_layers": 1,
+            "mrto_triangle_layers": 1,
+            "mrto_triangle_dim": 8,
+            "suiren_atom_dims": {"3d": 16},
+        }
+        sequential = SuirenFusionPropertyRegressor(4, 32, 2, 0.0, "property_irc_rp_bo", **kwargs).eval()
+        joint = SuirenFusionPropertyRegressor(
+            4,
+            32,
+            2,
+            0.0,
+            "property_irc_rp_bo",
+            joint_encoder_pass=True,
+            **kwargs,
+        ).eval()
+        joint.load_state_dict(sequential.state_dict())
+        batch = property_batch(geometry=True)
+        add_suiren_features(batch)
+        batch.pop("suiren_3d_graph_features")
+        add_masked_edit_view(batch)
+        with torch.no_grad():
+            expected = sequential(batch)
+            actual = joint(batch)
+        self.assertEqual(expected.keys(), actual.keys())
+        for key in expected:
+            torch.testing.assert_close(expected[key], actual[key], atol=3e-5, rtol=3e-5)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,77 @@ from rfm.data.reaction_samples import EDIT_CLASSES, ENERGY_TARGETS
 from rfm.features.mrto import MRTOReactionEncoder, MRTOReactionInputAdapter
 from rfm.features.mrto_v1 import MRTOv1ReactionEncoder, MRTOv1ReactionInputAdapter
 from rfm.features.radar import RADARReactionEncoder, RADARReactionInputAdapter
-from rfm.features.token_space import MaskedEditAdapter, RPairPropertyAdapter, TokenSpaceReactionEncoder, UnifiedReactionInputAdapter
+from rfm.features.token_space import (
+    MaskedEditAdapter,
+    RFMEncoderInput,
+    RPairPropertyAdapter,
+    TokenSpaceReactionEncoder,
+    UnifiedReactionInputAdapter,
+)
+
+
+def _concat_mrto_v1_inputs(first: RFMEncoderInput, second: RFMEncoderInput) -> RFMEncoderInput:
+    """Batch two parity-typed MRTO inputs without changing their semantics."""
+
+    def concat_field(group: str) -> dict[str, torch.Tensor]:
+        first_fields = first.metadata[group]
+        second_fields = second.metadata[group]
+        if first_fields.keys() != second_fields.keys():
+            raise ValueError(f"MRTO input field mismatch for {group}")
+        return {key: torch.cat([first_fields[key], second_fields[key]], dim=0) for key in first_fields}
+
+    batch_first = first.atom_tokens.shape[0]
+    batch_second = second.atom_tokens.shape[0]
+    modality_names = set(first.modality_mask) | set(second.modality_mask)
+    modality = {}
+    for name in modality_names:
+        first_mask = first.modality_mask.get(name)
+        second_mask = second.modality_mask.get(name)
+        if first_mask is None:
+            first_mask = torch.zeros(batch_first, dtype=torch.bool, device=first.atom_tokens.device)
+        if second_mask is None:
+            second_mask = torch.zeros(batch_second, dtype=torch.bool, device=second.atom_tokens.device)
+        modality[name] = torch.cat([first_mask, second_mask], dim=0)
+
+    context_first = first.metadata.get("mrto_context_minus")
+    context_second = second.metadata.get("mrto_context_minus")
+    if context_first is None:
+        context_first = torch.zeros_like(first.reaction_token)
+    if context_second is None:
+        context_second = torch.zeros_like(second.reaction_token)
+    out = RFMEncoderInput(
+        atom_tokens=torch.cat([first.atom_tokens, second.atom_tokens], dim=0),
+        pair_tokens=torch.cat([first.pair_tokens, second.pair_tokens], dim=0),
+        reaction_token=torch.cat([first.reaction_token, second.reaction_token], dim=0),
+        atom_valid_mask=torch.cat([first.atom_valid_mask, second.atom_valid_mask], dim=0),
+        pair_valid_mask=torch.cat([first.pair_valid_mask, second.pair_valid_mask], dim=0),
+        modality_mask=modality,
+        task_name="joint_property_masked_edit",
+        metadata={
+            "encoder_family": "mrto_v1",
+            "mrto_atom_fields": concat_field("mrto_atom_fields"),
+            "mrto_pair_fields": concat_field("mrto_pair_fields"),
+            "mrto_operator_pair_mask": torch.cat(
+                [first.metadata["mrto_operator_pair_mask"], second.metadata["mrto_operator_pair_mask"]],
+                dim=0,
+            ),
+            "mrto_context_minus": torch.cat([context_first, context_second], dim=0),
+        },
+    )
+    out.validate()
+    return out
+
+
+def _split_encoded_batch(
+    encoded: dict[str, torch.Tensor],
+    first_batch_size: int,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    first: dict[str, torch.Tensor] = {}
+    second: dict[str, torch.Tensor] = {}
+    for key, value in encoded.items():
+        first[key] = value[:first_batch_size]
+        second[key] = value[first_batch_size:]
+    return first, second
 
 
 class AtomAttentionReadout(nn.Module):
@@ -288,10 +358,14 @@ class ReactionPropertyRegressor(nn.Module):
         mrto_event_topk: int = 0,
         mrto_event_feedback_scale: float = 0.5,
         mrto_geometry_rbf_bins: int = 16,
+        joint_encoder_pass: bool = False,
     ):
         super().__init__()
         masked_schema, masked_pair_raw_dim = _masked_edit_schema_for_property(input_schema)
         self.encoder_type = encoder_type
+        self.joint_encoder_pass = bool(joint_encoder_pass)
+        if self.joint_encoder_pass and encoder_type != "mrto_v1":
+            raise ValueError("joint_encoder_pass is currently supported only by encoder_type='mrto_v1'")
         if encoder_type == "mrto_v1":
             if directional_3d_adapter:
                 raise ValueError("directional_3d_adapter is only supported by encoder_type='token_space'")
@@ -421,7 +495,13 @@ class ReactionPropertyRegressor(nn.Module):
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         encoder_input = self.adapter(batch)
-        encoded = self.encoder(encoder_input)
+        masked_encoded: dict[str, torch.Tensor] | None = None
+        if self.joint_encoder_pass and "masked_pair_input" in batch:
+            masked_input = self.masked_adapter(self._masked_batch(batch))
+            joint_encoded = self.encoder(_concat_mrto_v1_inputs(encoder_input, masked_input))
+            encoded, masked_encoded = _split_encoded_batch(joint_encoded, encoder_input.atom_tokens.shape[0])
+        else:
+            encoded = self.encoder(encoder_input)
         atom_h = encoded["atom_h"]
         atom_mask = batch["atom_mask"].bool()
         if self.atom_readout is None:
@@ -445,18 +525,24 @@ class ReactionPropertyRegressor(nn.Module):
             if key in encoded:
                 out[key] = encoded[key]
         if "masked_pair_input" in batch:
-            masked_out = self._masked_forward(batch)
+            masked_out = (
+                self._masked_outputs(masked_encoded)
+                if masked_encoded is not None
+                else self._masked_forward(batch)
+            )
             out.update({f"masked_{key}": value for key, value in masked_out.items()})
         return out
 
-    def _masked_forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        masked_batch = {
+    @staticmethod
+    def _masked_batch(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {
             "z": batch["z"],
             "atom_mask": batch["atom_mask"],
             "pair_input": batch["masked_pair_input"],
             "pair_valid": batch["masked_pair_valid"],
         }
-        encoded = self.encoder(self.masked_adapter(masked_batch))
+
+    def _masked_outputs(self, encoded: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         out = _masked_edit_outputs(self.masked_edit_heads, encoded)
         out["reaction_h"] = encoded["reaction_h"]
         for key in (
@@ -469,6 +555,10 @@ class ReactionPropertyRegressor(nn.Module):
             if key in encoded:
                 out[key] = encoded[key]
         return out
+
+    def _masked_forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        encoded = self.encoder(self.masked_adapter(self._masked_batch(batch)))
+        return self._masked_outputs(encoded)
 
 
 class SuirenFusionPropertyRegressor(nn.Module):
@@ -511,10 +601,14 @@ class SuirenFusionPropertyRegressor(nn.Module):
         mrto_event_topk: int = 0,
         mrto_event_feedback_scale: float = 0.5,
         mrto_geometry_rbf_bins: int = 16,
+        joint_encoder_pass: bool = False,
     ):
         super().__init__()
         masked_schema, masked_pair_raw_dim = _masked_edit_schema_for_property(input_schema)
         self.encoder_type = encoder_type
+        self.joint_encoder_pass = bool(joint_encoder_pass)
+        if self.joint_encoder_pass and encoder_type != "mrto_v1":
+            raise ValueError("joint_encoder_pass is currently supported only by encoder_type='mrto_v1'")
         if encoder_type == "mrto_v1":
             if directional_3d_adapter:
                 raise ValueError("directional_3d_adapter is only supported by encoder_type='token_space'")
@@ -635,7 +729,13 @@ class SuirenFusionPropertyRegressor(nn.Module):
                 raise ValueError(f"Suiren cache contains failed rows in {key}; rebuild the cache before training or evaluation")
 
         encoder_input = self.input_adapter(batch)
-        encoded = self.encoder(encoder_input)
+        masked_encoded: dict[str, torch.Tensor] | None = None
+        if self.joint_encoder_pass and "masked_pair_input" in batch:
+            masked_input = self.masked_adapter(self._masked_batch(batch))
+            joint_encoded = self.encoder(_concat_mrto_v1_inputs(encoder_input, masked_input))
+            encoded, masked_encoded = _split_encoded_batch(joint_encoded, encoder_input.atom_tokens.shape[0])
+        else:
+            encoded = self.encoder(encoder_input)
         atom_h = encoded["atom_h"]
         atom_mask = batch["atom_mask"].bool()
         if self.atom_readout is None:
@@ -659,18 +759,24 @@ class SuirenFusionPropertyRegressor(nn.Module):
             if key in encoded:
                 out[key] = encoded[key]
         if "masked_pair_input" in batch:
-            masked_out = self._masked_forward(batch)
+            masked_out = (
+                self._masked_outputs(masked_encoded)
+                if masked_encoded is not None
+                else self._masked_forward(batch)
+            )
             out.update({f"masked_{key}": value for key, value in masked_out.items()})
         return out
 
-    def _masked_forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        masked_batch = {
+    @staticmethod
+    def _masked_batch(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {
             "z": batch["z"],
             "atom_mask": batch["atom_mask"],
             "pair_input": batch["masked_pair_input"],
             "pair_valid": batch["masked_pair_valid"],
         }
-        encoded = self.encoder(self.masked_adapter(masked_batch))
+
+    def _masked_outputs(self, encoded: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         out = _masked_edit_outputs(self.masked_edit_heads, encoded)
         out["reaction_h"] = encoded["reaction_h"]
         for key in (
@@ -683,6 +789,10 @@ class SuirenFusionPropertyRegressor(nn.Module):
             if key in encoded:
                 out[key] = encoded[key]
         return out
+
+    def _masked_forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        encoded = self.encoder(self.masked_adapter(self._masked_batch(batch)))
+        return self._masked_outputs(encoded)
 
 
 def _masked_edit_schema_for_property(input_schema: str) -> tuple[str, int]:
