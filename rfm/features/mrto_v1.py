@@ -165,6 +165,11 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
         geometry_rbf_bins: int = 16,
         geometry_neighbor_cutoff: float = 0.6,
         dropout: float = 0.0,
+        suiren_atom_dim: int = 0,
+        suiren_graph_dim: int = 0,
+        suiren_atom_dims: dict[str, int] | None = None,
+        suiren_graph_dims: dict[str, int] | None = None,
+        enable_suiren_gates: bool = False,
     ):
         super().__init__(hidden_dim, task_name=task_name)
         schema = input_schema or infer_pair_basis_schema(
@@ -174,6 +179,22 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
         self.featurizer = ReactionInputFeaturizer(schema, distance_clip=distance_clip)
         self.use_odd_field = bool(use_odd_field)
         self.geometry_neighbor_cutoff = float(geometry_neighbor_cutoff)
+        self.enable_suiren_gates = bool(enable_suiren_gates)
+        self.suiren_atom_dims = dict(suiren_atom_dims or {})
+        self.suiren_graph_dims = dict(suiren_graph_dims or {})
+        if suiren_atom_dim > 0 and not self.suiren_atom_dims:
+            self.suiren_atom_dims["generic"] = suiren_atom_dim
+        if suiren_graph_dim > 0 and not self.suiren_graph_dims:
+            self.suiren_graph_dims["generic"] = suiren_graph_dim
+        invalid_atom_dims = {name: dim for name, dim in self.suiren_atom_dims.items() if dim <= 0 or dim % 4}
+        invalid_graph_dims = {name: dim for name, dim in self.suiren_graph_dims.items() if dim <= 0 or dim % 4}
+        if invalid_atom_dims or invalid_graph_dims:
+            raise ValueError(
+                "MRTO-v1 Suiren features require [h_R,h_P,Delta_h,abs_Delta_h] "
+                f"with four equal-width blocks, atom={invalid_atom_dims}, graph={invalid_graph_dims}"
+            )
+        self.suiren_atom_state_dims = {name: dim // 4 for name, dim in self.suiren_atom_dims.items()}
+        self.suiren_graph_state_dims = {name: dim // 4 for name, dim in self.suiren_graph_dims.items()}
         self.z_embedding = nn.Embedding(max_z + 1, hidden_dim)
 
         # BO and adjacency are deliberately projected before normalization. In
@@ -192,6 +213,60 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
         self.odd_pair_projection = OddMLP(4, hidden_dim, dropout)
         self.even_atom_projection = _feature_projection(5, hidden_dim, dropout)
         self.odd_atom_projection = OddMLP(4, hidden_dim, dropout)
+        self.suiren_atom_state_projection = nn.ModuleDict(
+            {
+                name: _feature_projection(dim, hidden_dim, dropout)
+                for name, dim in sorted(self.suiren_atom_state_dims.items())
+            }
+        )
+        self.suiren_atom_abs_delta_projection = nn.ModuleDict(
+            {
+                name: _feature_projection(dim, hidden_dim, dropout)
+                for name, dim in sorted(self.suiren_atom_state_dims.items())
+            }
+        )
+        self.suiren_atom_delta_projection = nn.ModuleDict(
+            {
+                name: OddMLP(dim, hidden_dim, dropout)
+                for name, dim in sorted(self.suiren_atom_state_dims.items())
+            }
+        )
+        self.suiren_graph_state_projection = nn.ModuleDict(
+            {
+                name: _feature_projection(dim, hidden_dim, dropout)
+                for name, dim in sorted(self.suiren_graph_state_dims.items())
+            }
+        )
+        self.suiren_graph_abs_delta_projection = nn.ModuleDict(
+            {
+                name: _feature_projection(dim, hidden_dim, dropout)
+                for name, dim in sorted(self.suiren_graph_state_dims.items())
+            }
+        )
+        self.suiren_graph_delta_projection = nn.ModuleDict(
+            {
+                name: OddMLP(dim, hidden_dim, dropout)
+                for name, dim in sorted(self.suiren_graph_state_dims.items())
+            }
+        )
+        self.suiren_atom_gate_logits = nn.ParameterDict(
+            {name: nn.Parameter(torch.zeros(())) for name in self.suiren_atom_state_projection}
+        )
+        self.suiren_graph_gate_logits = nn.ParameterDict(
+            {name: nn.Parameter(torch.zeros(())) for name in self.suiren_graph_state_projection}
+        )
+
+    @staticmethod
+    def suiren_feature_key(stream: str, level: str) -> str:
+        if stream == "generic":
+            return f"suiren_{level}_features"
+        return f"suiren_{stream}_{level}_features"
+
+    def _suiren_scale(self, stream: str, level: str) -> torch.Tensor:
+        if not self.enable_suiren_gates:
+            return self.z_embedding.weight.new_ones(())
+        logits = self.suiren_atom_gate_logits[stream] if level == "atom" else self.suiren_graph_gate_logits[stream]
+        return 2.0 * torch.sigmoid(logits)
 
     def forward(self, batch: dict[str, torch.Tensor]) -> RFMEncoderInput:
         z = batch["z"].clamp(0, self.z_embedding.num_embeddings - 1)
@@ -277,8 +352,30 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
         if d_p is not None:
             endpoint_p_mask |= (d_p < self.geometry_neighbor_cutoff) & pair_mask
 
-        atom_r = self.z_embedding(z) * atom_mask.unsqueeze(-1)
-        atom_p = self.z_embedding(z) * atom_mask.unsqueeze(-1)
+        atom_r = self.z_embedding(z)
+        atom_p = self.z_embedding(z)
+        suiren_atom_even = torch.zeros_like(atom_r)
+        suiren_atom_odd = torch.zeros_like(atom_r)
+        has_suiren_atom = False
+        for stream, projection in self.suiren_atom_state_projection.items():
+            key = self.suiren_feature_key(stream, "atom")
+            if key not in batch:
+                continue
+            feature = batch[key]
+            state_dim = self.suiren_atom_state_dims[stream]
+            if feature.shape[:2] != atom_r.shape[:2] or feature.shape[-1] != state_dim * 4:
+                raise ValueError(
+                    f"{key} must be [B,N,{state_dim * 4}], got {tuple(feature.shape)}"
+                )
+            h_r, h_p, delta_h, abs_delta_h = feature.split(state_dim, dim=-1)
+            scale = self._suiren_scale(stream, "atom")
+            atom_r = atom_r + scale * projection(h_r)
+            atom_p = atom_p + scale * projection(h_p)
+            suiren_atom_even = suiren_atom_even + scale * self.suiren_atom_abs_delta_projection[stream](abs_delta_h)
+            suiren_atom_odd = suiren_atom_odd + scale * self.suiren_atom_delta_projection[stream](delta_h)
+            has_suiren_atom = True
+        atom_r = atom_r * atom_mask.unsqueeze(-1)
+        atom_p = atom_p * atom_mask.unsqueeze(-1)
         for block in self.endpoint_blocks:
             atom_r, pair_r = block(atom_r, pair_r, atom_mask, endpoint_r_mask, pair_mask)
             atom_p, pair_p = block(atom_p, pair_p, atom_mask, endpoint_p_mask, pair_mask)
@@ -290,8 +387,8 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
 
         even_atom_raw = _masked_pair_mean(even_raw, pair_mask)
         odd_atom_raw = _masked_pair_mean(odd_raw, pair_mask)
-        atom_plus = 0.5 * (atom_r + atom_p) + self.even_atom_projection(even_atom_raw)
-        atom_minus = 0.5 * (atom_p - atom_r) + self.odd_atom_projection(odd_atom_raw)
+        atom_plus = 0.5 * (atom_r + atom_p) + self.even_atom_projection(even_atom_raw) + suiren_atom_even
+        atom_minus = 0.5 * (atom_p - atom_r) + self.odd_atom_projection(odd_atom_raw) + suiren_atom_odd
         if not self.use_odd_field:
             atom_minus = torch.zeros_like(atom_plus)
             pair_minus = torch.zeros_like(pair_plus)
@@ -307,6 +404,10 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
             operator_pair_mask |= (d_p < self.geometry_neighbor_cutoff) & pair_mask
 
         spec = self.featurizer.spec
+        has_suiren_graph = any(
+            self.suiren_feature_key(stream, "graph") in batch for stream in self.suiren_graph_state_projection
+        )
+        has_suiren = bool(has_suiren_atom or has_suiren_graph)
         modality = self.modality_dict(
             z.shape[0],
             z.device,
@@ -316,10 +417,31 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
             has_partial_Delta_BO=spec.has_partial_delta_bo,
             has_R_3D=spec.has_r_3d,
             has_P_3D=spec.has_p_3d,
-            has_Suiren_R=False,
-            has_Suiren_P=False,
+            has_Suiren_R=has_suiren,
+            has_Suiren_P=has_suiren,
         )
         context_token = self.task_embedding.unsqueeze(0) + self.modality_token(modality)
+        context_minus = torch.zeros_like(context_token)
+        for stream, projection in self.suiren_graph_state_projection.items():
+            key = self.suiren_feature_key(stream, "graph")
+            if key not in batch:
+                continue
+            feature = batch[key]
+            state_dim = self.suiren_graph_state_dims[stream]
+            if feature.shape != (z.shape[0], state_dim * 4):
+                raise ValueError(f"{key} must be [B,{state_dim * 4}], got {tuple(feature.shape)}")
+            h_r, h_p, delta_h, abs_delta_h = feature.split(state_dim, dim=-1)
+            scale = self._suiren_scale(stream, "graph")
+            projected_r = projection(h_r)
+            projected_p = projection(h_p)
+            context_token = context_token + scale * (
+                0.5 * (projected_r + projected_p)
+                + self.suiren_graph_abs_delta_projection[stream](abs_delta_h)
+            )
+            context_minus = context_minus + scale * (
+                0.5 * (projected_p - projected_r)
+                + self.suiren_graph_delta_projection[stream](delta_h)
+            )
         out = RFMEncoderInput(
             atom_tokens=(atom_plus + atom_minus) * atom_mask.unsqueeze(-1),
             pair_tokens=(pair_plus + pair_minus) * pair_mask.unsqueeze(-1),
@@ -336,6 +458,14 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
                 "mrto_pair_fields": {"p_plus": pair_plus, "p_minus": pair_minus},
                 "mrto_operator_pair_mask": operator_pair_mask,
                 "mrto_use_odd_field": self.use_odd_field,
+                "mrto_context_minus": context_minus,
+                "suiren_atom_dims": self.suiren_atom_dims,
+                "suiren_atom_state_dims": self.suiren_atom_state_dims,
+                "suiren_graph_dims": self.suiren_graph_dims,
+                "suiren_graph_state_dims": self.suiren_graph_state_dims,
+                "suiren_layout": ("h_R", "h_P", "Delta_h", "abs_Delta_h"),
+                "suiren_pair_tokens": False,
+                "suiren_input_gates": self.enable_suiren_gates,
             },
         )
         out.validate()
@@ -741,7 +871,12 @@ class MRTOv1ReactionEncoder(nn.Module):
         batch = atom_plus.shape[0]
         event_plus = self.event_plus_init.unsqueeze(0).expand(batch, -1, -1)
         event_plus = event_plus + self.context_to_event(encoder_input.reaction_token).unsqueeze(1)
-        event_minus = torch.zeros_like(event_plus)
+        context_minus = encoder_input.metadata.get("mrto_context_minus")
+        event_minus = (
+            context_minus.unsqueeze(1).expand_as(event_plus)
+            if context_minus is not None
+            else torch.zeros_like(event_plus)
+        )
         center: MRTOv1CenterState | None = None
         for block in self.layers:
             atom_plus, atom_minus, pair_plus, pair_minus, event_plus, event_minus, center = block(

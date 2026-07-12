@@ -498,11 +498,66 @@ class SuirenFusionPropertyRegressor(nn.Module):
         radar_pair_update_scale: float = 0.75,
         radar_reaction_update_scale: float = 1.0,
         radar_router_gate_init: float = 0.05,
+        mrto_attention_heads: int = 8,
+        mrto_event_slots: int = 4,
+        mrto_use_event_slots: bool = True,
+        mrto_use_odd_field: bool = True,
+        mrto_pair_update_scale: float = 1.0,
+        mrto_reaction_update_scale: float = 1.0,
+        mrto_endpoint_layers: int = 2,
+        mrto_triangle_layers: int = 2,
+        mrto_triangle_dim: int = 16,
+        mrto_triangle_scale: float = 0.5,
+        mrto_event_topk: int = 0,
+        mrto_event_feedback_scale: float = 0.5,
+        mrto_geometry_rbf_bins: int = 16,
     ):
         super().__init__()
         masked_schema, masked_pair_raw_dim = _masked_edit_schema_for_property(input_schema)
         self.encoder_type = encoder_type
-        if encoder_type == "radar":
+        if encoder_type == "mrto_v1":
+            if directional_3d_adapter:
+                raise ValueError("directional_3d_adapter is only supported by encoder_type='token_space'")
+            if not mrto_use_event_slots:
+                raise ValueError("encoder_type='mrto_v1' requires event slots")
+            adapter_kwargs = {
+                "hidden_dim": hidden_dim,
+                "use_odd_field": mrto_use_odd_field,
+                "endpoint_layers": mrto_endpoint_layers,
+                "geometry_rbf_bins": mrto_geometry_rbf_bins,
+                "dropout": dropout,
+            }
+            self.input_adapter = MRTOv1ReactionInputAdapter(
+                pair_input_dim=pair_raw_dim,
+                input_schema=input_schema,
+                task_name="suiren_fusion_property",
+                suiren_atom_dim=suiren_atom_dim,
+                suiren_graph_dim=suiren_graph_dim,
+                suiren_atom_dims=suiren_atom_dims,
+                suiren_graph_dims=suiren_graph_dims,
+                enable_suiren_gates=enable_suiren_input_gates,
+                **adapter_kwargs,
+            )
+            self.masked_adapter = MRTOv1ReactionInputAdapter(
+                pair_input_dim=masked_pair_raw_dim,
+                input_schema=masked_schema,
+                task_name="masked_edit",
+                **adapter_kwargs,
+            )
+            self.encoder = MRTOv1ReactionEncoder(
+                hidden_dim=hidden_dim,
+                layers=layers,
+                dropout=dropout,
+                attention_heads=mrto_attention_heads,
+                event_slots=mrto_event_slots,
+                triangle_layers=mrto_triangle_layers,
+                triangle_dim=mrto_triangle_dim,
+                triangle_scale=mrto_triangle_scale,
+                pair_update_scale=mrto_pair_update_scale,
+                event_topk=mrto_event_topk,
+                event_feedback_scale=mrto_event_feedback_scale,
+            )
+        elif encoder_type == "radar":
             if directional_3d_adapter:
                 raise ValueError("directional_3d_adapter is only supported by encoder_type='token_space'")
             self.input_adapter = RADARReactionInputAdapter(
@@ -562,7 +617,7 @@ class SuirenFusionPropertyRegressor(nn.Module):
             raise ValueError(f"unsupported encoder_type={encoder_type!r}")
         self.masked_edit_heads = MaskedEditHeads(
             hidden_dim,
-            router_residual=encoder_type == "radar" and radar_center_router,
+            router_residual=(encoder_type == "radar" and radar_center_router) or encoder_type == "mrto_v1",
             router_gate_init=radar_router_gate_init,
         )
         self.atom_readout = AtomAttentionReadout(hidden_dim) if attention_readout else None
@@ -594,6 +649,15 @@ class SuirenFusionPropertyRegressor(nn.Module):
             "y": y,
             "reaction_h": encoded["reaction_h"],
         }
+        for key in (
+            "mrto_event_pair_weights",
+            "mrto_event_plus",
+            "mrto_event_minus",
+            "mrto_reaction_plus",
+            "mrto_reaction_minus",
+        ):
+            if key in encoded:
+                out[key] = encoded[key]
         if "masked_pair_input" in batch:
             masked_out = self._masked_forward(batch)
             out.update({f"masked_{key}": value for key, value in masked_out.items()})
@@ -609,6 +673,15 @@ class SuirenFusionPropertyRegressor(nn.Module):
         encoded = self.encoder(self.masked_adapter(masked_batch))
         out = _masked_edit_outputs(self.masked_edit_heads, encoded)
         out["reaction_h"] = encoded["reaction_h"]
+        for key in (
+            "mrto_event_pair_weights",
+            "mrto_event_plus",
+            "mrto_event_minus",
+            "mrto_reaction_plus",
+            "mrto_reaction_minus",
+        ):
+            if key in encoded:
+                out[key] = encoded[key]
         return out
 
 

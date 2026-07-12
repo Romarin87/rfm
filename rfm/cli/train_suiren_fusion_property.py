@@ -52,18 +52,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--encoder-type", choices=("token_space", "radar"), default="token_space")
+    parser.add_argument("--encoder-type", choices=("token_space", "radar", "mrto_v1"), default="token_space")
     parser.add_argument("--radar-attention-heads", type=int, default=8)
     parser.add_argument("--radar-center-router", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--radar-delta-stream", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--radar-pair-update-scale", type=float, default=0.75)
     parser.add_argument("--radar-reaction-update-scale", type=float, default=1.0)
     parser.add_argument("--radar-router-gate-init", type=float, default=0.05)
+    parser.add_argument("--mrto-attention-heads", type=int, default=8)
+    parser.add_argument("--mrto-event-slots", type=int, default=4)
+    parser.add_argument("--mrto-use-event-slots", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mrto-use-odd-field", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mrto-pair-update-scale", type=float, default=1.0)
+    parser.add_argument("--mrto-reaction-update-scale", type=float, default=1.0)
+    parser.add_argument("--mrto-endpoint-layers", type=int, default=2)
+    parser.add_argument("--mrto-triangle-layers", type=int, default=2)
+    parser.add_argument("--mrto-triangle-dim", type=int, default=16)
+    parser.add_argument("--mrto-triangle-scale", type=float, default=0.5)
+    parser.add_argument("--mrto-event-topk", type=int, default=0)
+    parser.add_argument("--mrto-event-feedback-scale", type=float, default=0.5)
+    parser.add_argument("--mrto-geometry-rbf-bins", type=int, default=16)
+    parser.add_argument("--mrto-event-set-weight", type=float, default=0.0)
+    parser.add_argument("--mrto-event-diversity-weight", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--geometry-mode", choices=("2d", "irc_rp"), default="2d")
     parser.add_argument("--stage-a-weight", type=float, default=0.5)
@@ -314,14 +330,27 @@ def main(argv: list[str] | None = None) -> None:
         radar_pair_update_scale=args.radar_pair_update_scale,
         radar_reaction_update_scale=args.radar_reaction_update_scale,
         radar_router_gate_init=args.radar_router_gate_init,
+        mrto_attention_heads=args.mrto_attention_heads,
+        mrto_event_slots=args.mrto_event_slots,
+        mrto_use_event_slots=args.mrto_use_event_slots,
+        mrto_use_odd_field=args.mrto_use_odd_field,
+        mrto_pair_update_scale=args.mrto_pair_update_scale,
+        mrto_reaction_update_scale=args.mrto_reaction_update_scale,
+        mrto_endpoint_layers=args.mrto_endpoint_layers,
+        mrto_triangle_layers=args.mrto_triangle_layers,
+        mrto_triangle_dim=args.mrto_triangle_dim,
+        mrto_triangle_scale=args.mrto_triangle_scale,
+        mrto_event_topk=args.mrto_event_topk,
+        mrto_event_feedback_scale=args.mrto_event_feedback_scale,
+        mrto_geometry_rbf_bins=args.mrto_geometry_rbf_bins,
     ).to(device)
     if args.pretrained_stage_a and args.pretrained_encoder:
         raise ValueError("use either --pretrained-stage-a or --pretrained-encoder, not both")
     if args.pretrained_stage_a:
         load_stage_a_checkpoint(model, args.pretrained_stage_a, device)
     elif args.pretrained_encoder:
-        if args.encoder_type == "radar":
-            raise ValueError("RADAR Stage C requires --pretrained-stage-a so the adapter and edit heads are restored")
+        if args.encoder_type in {"radar", "mrto_v1"}:
+            raise ValueError(f"{args.encoder_type} Stage C requires --pretrained-stage-a so the adapter and edit heads are restored")
         load_pretrained_encoder(model, args.pretrained_encoder, device)
     if args.freeze_encoder:
         for param in model.encoder.parameters():
@@ -413,6 +442,15 @@ def main(argv: list[str] | None = None) -> None:
                 "radar_pair_update_scale": args.radar_pair_update_scale,
                 "radar_reaction_update_scale": args.radar_reaction_update_scale,
                 "radar_router_gate_init": args.radar_router_gate_init,
+                "mrto_attention_heads": args.mrto_attention_heads,
+                "mrto_event_slots": args.mrto_event_slots,
+                "mrto_pair_update_scale": args.mrto_pair_update_scale,
+                "mrto_endpoint_layers": args.mrto_endpoint_layers,
+                "mrto_triangle_layers": args.mrto_triangle_layers,
+                "mrto_triangle_dim": args.mrto_triangle_dim,
+                "mrto_triangle_scale": args.mrto_triangle_scale,
+                "mrto_event_topk": args.mrto_event_topk,
+                "mrto_event_feedback_scale": args.mrto_event_feedback_scale,
                 "suiren_input_gates": args.enable_suiren_input_gates,
                 "dynamic_pair_update": args.enable_dynamic_pair_update,
                 "dynamic_pair_update_scale": args.dynamic_pair_update_scale,
@@ -469,9 +507,27 @@ def main(argv: list[str] | None = None) -> None:
                     "router_gate_init": args.radar_router_gate_init,
                     "router_residual": args.radar_center_router,
                 },
+                "mrto": {
+                    "attention_heads": args.mrto_attention_heads,
+                    "event_slots": args.mrto_event_slots,
+                    "use_event_slots": args.mrto_use_event_slots,
+                    "use_odd_field": args.mrto_use_odd_field,
+                    "pair_update_scale": args.mrto_pair_update_scale,
+                    "reaction_update_scale": args.mrto_reaction_update_scale,
+                    "endpoint_layers": args.mrto_endpoint_layers,
+                    "triangle_layers": args.mrto_triangle_layers,
+                    "triangle_dim": args.mrto_triangle_dim,
+                    "triangle_scale": args.mrto_triangle_scale,
+                    "event_topk": args.mrto_event_topk,
+                    "event_feedback_scale": args.mrto_event_feedback_scale,
+                    "geometry_rbf_bins": args.mrto_geometry_rbf_bins,
+                    "event_set_weight": args.mrto_event_set_weight,
+                    "event_diversity_weight": args.mrto_event_diversity_weight,
+                },
                 "suiren_input_semantics": {
-                    "graph_features": "initial_reaction_token_input_projection",
-                    "atom_features": "atom_token_input_projection_aligned_by_atom_map_order",
+                    "graph_features": "initial_reaction_or_event_context_input_projection",
+                    "atom_features": "endpoint_atom_state_input_projection_aligned_by_atom_map_order",
+                    "mrto_parity": "R/P shared state projection with even abs-delta and odd signed-delta fields",
                     "suiren_pair_tokens": False,
                     "encoder_output_shape_fixed": True,
                 },
@@ -501,6 +557,7 @@ def main(argv: list[str] | None = None) -> None:
                     "persistent_workers": args.persistent_workers if args.num_workers > 0 else False,
                     "prefetch_factor": args.prefetch_factor if args.num_workers > 0 else None,
                 },
+                "effective_batch_size_per_process": args.batch_size * args.gradient_accumulation_steps,
                 "model_improvement_switches": {
                     "encoder_type": args.encoder_type,
                     "radar_attention_heads": args.radar_attention_heads,
@@ -509,6 +566,15 @@ def main(argv: list[str] | None = None) -> None:
                     "radar_pair_update_scale": args.radar_pair_update_scale,
                     "radar_reaction_update_scale": args.radar_reaction_update_scale,
                     "radar_router_gate_init": args.radar_router_gate_init,
+                    "mrto_attention_heads": args.mrto_attention_heads,
+                    "mrto_event_slots": args.mrto_event_slots,
+                    "mrto_pair_update_scale": args.mrto_pair_update_scale,
+                    "mrto_endpoint_layers": args.mrto_endpoint_layers,
+                    "mrto_triangle_layers": args.mrto_triangle_layers,
+                    "mrto_triangle_dim": args.mrto_triangle_dim,
+                    "mrto_triangle_scale": args.mrto_triangle_scale,
+                    "mrto_event_topk": args.mrto_event_topk,
+                    "mrto_event_feedback_scale": args.mrto_event_feedback_scale,
                     "suiren_input_gates": args.enable_suiren_input_gates,
                     "dynamic_pair_update": args.enable_dynamic_pair_update,
                     "dynamic_pair_update_scale": args.dynamic_pair_update_scale,

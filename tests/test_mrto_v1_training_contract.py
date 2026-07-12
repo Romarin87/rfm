@@ -7,7 +7,12 @@ from pathlib import Path
 import torch
 
 from rfm.features.mrto_v1 import MRTOv1ReactionEncoder, MRTOv1ReactionInputAdapter
-from rfm.models.task_models import MaskedEditPretrainingModel, ReactionPropertyRegressor, load_stage_a_checkpoint
+from rfm.models.task_models import (
+    MaskedEditPretrainingModel,
+    ReactionPropertyRegressor,
+    SuirenFusionPropertyRegressor,
+    load_stage_a_checkpoint,
+)
 
 
 def pair_mask(batch_size: int, n_atoms: int) -> torch.Tensor:
@@ -44,7 +49,26 @@ def reverse_property_batch(batch: dict[str, torch.Tensor], *, geometry: bool = F
     reverse = {key: value.clone() for key, value in batch.items()}
     order = [1, 0, 3, 2] if geometry else [1, 0]
     reverse["pair_input"] = batch["pair_input"][..., order]
+    for key in ("suiren_3d_atom_features", "suiren_3d_graph_features"):
+        if key not in batch:
+            continue
+        h_r, h_p, delta_h, abs_delta_h = batch[key].chunk(4, dim=-1)
+        reverse[key] = torch.cat([h_p, h_r, -delta_h, abs_delta_h], dim=-1)
     return reverse
+
+
+def add_suiren_features(batch: dict[str, torch.Tensor], state_dim: int = 4) -> None:
+    batch_size, n_atoms = batch["atom_mask"].shape
+    atom_r = torch.randn(batch_size, n_atoms, state_dim)
+    atom_p = torch.randn(batch_size, n_atoms, state_dim)
+    atom_delta = atom_p - atom_r
+    batch["suiren_3d_atom_features"] = torch.cat([atom_r, atom_p, atom_delta, atom_delta.abs()], dim=-1)
+    graph_r = torch.randn(batch_size, state_dim)
+    graph_p = torch.randn(batch_size, state_dim)
+    graph_delta = graph_p - graph_r
+    batch["suiren_3d_graph_features"] = torch.cat(
+        [graph_r, graph_p, graph_delta, graph_delta.abs()], dim=-1
+    )
 
 
 def masked_batch() -> dict[str, torch.Tensor]:
@@ -139,6 +163,60 @@ class MRTOv1TrainingContractTest(unittest.TestCase):
     def test_exact_3d_forward_reverse_parity(self) -> None:
         self._assert_parity(geometry=True)
 
+    def test_suiren_atom_and_graph_inputs_preserve_forward_reverse_parity(self) -> None:
+        adapter = MRTOv1ReactionInputAdapter(
+            hidden_dim=32,
+            pair_input_dim=4,
+            input_schema="property_irc_rp_bo",
+            task_name="suiren_fusion_property",
+            endpoint_layers=1,
+            dropout=0.0,
+            suiren_atom_dims={"3d": 16},
+            suiren_graph_dims={"3d": 16},
+        ).eval()
+        encoder = MRTOv1ReactionEncoder(
+            hidden_dim=32,
+            layers=2,
+            dropout=0.0,
+            attention_heads=4,
+            event_slots=3,
+            triangle_layers=1,
+            triangle_dim=8,
+        ).eval()
+        forward_batch = property_batch(geometry=True)
+        add_suiren_features(forward_batch)
+        reverse_batch = reverse_property_batch(forward_batch, geometry=True)
+        with torch.no_grad():
+            forward_input = adapter(forward_batch)
+            reverse_input = adapter(reverse_batch)
+            forward = encoder(forward_input)
+            reverse = encoder(reverse_input)
+
+        torch.testing.assert_close(
+            forward_input.metadata["mrto_context_minus"],
+            -reverse_input.metadata["mrto_context_minus"],
+            atol=2e-5,
+            rtol=2e-5,
+        )
+        for field in ("a_plus",):
+            torch.testing.assert_close(
+                forward_input.metadata["mrto_atom_fields"][field],
+                reverse_input.metadata["mrto_atom_fields"][field],
+                atol=2e-5,
+                rtol=2e-5,
+            )
+        for field in ("a_minus",):
+            torch.testing.assert_close(
+                forward_input.metadata["mrto_atom_fields"][field],
+                -reverse_input.metadata["mrto_atom_fields"][field],
+                atol=2e-5,
+                rtol=2e-5,
+            )
+        for name in ("mrto_atom_plus", "mrto_pair_plus", "mrto_event_plus", "mrto_reaction_plus"):
+            torch.testing.assert_close(forward[name], reverse[name], atol=3e-5, rtol=3e-5)
+        for name in ("mrto_atom_minus", "mrto_pair_minus", "mrto_event_minus", "mrto_reaction_minus"):
+            torch.testing.assert_close(forward[name], -reverse[name], atol=3e-5, rtol=3e-5)
+
     def test_raw_projection_keeps_single_bond_distinct_from_no_bond(self) -> None:
         adapter = MRTOv1ReactionInputAdapter(
             hidden_dim=16,
@@ -210,6 +288,38 @@ class MRTOv1TrainingContractTest(unittest.TestCase):
             self.assertEqual(source.keys(), target.keys())
             for key in source:
                 torch.testing.assert_close(source[key], target[key])
+
+    def test_stage_a_checkpoint_restores_into_suiren_v1_model(self) -> None:
+        kwargs = {
+            "encoder_type": "mrto_v1",
+            "mrto_attention_heads": 4,
+            "mrto_event_slots": 3,
+            "mrto_endpoint_layers": 1,
+            "mrto_triangle_layers": 1,
+            "mrto_triangle_dim": 8,
+        }
+        stage_a = MaskedEditPretrainingModel(4, 32, 2, 0.0, "masked_edit_irc_rp", **kwargs)
+        stage_c = SuirenFusionPropertyRegressor(
+            4,
+            32,
+            2,
+            0.0,
+            "property_irc_rp_bo",
+            suiren_atom_dims={"3d": 16},
+            **kwargs,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "model.pt"
+            torch.save({"model": stage_a.state_dict(), "config": {"encoder_type": "mrto_v1"}}, checkpoint)
+            load_stage_a_checkpoint(stage_c, str(checkpoint), torch.device("cpu"))
+        batch = property_batch(geometry=True)
+        add_suiren_features(batch)
+        batch.pop("suiren_3d_graph_features")
+        with torch.no_grad():
+            output = stage_c(batch)
+        self.assertEqual(tuple(output["y"].shape), (2, 2))
+        self.assertEqual(tuple(output["reaction_h"].shape), (2, 32))
+        self.assertEqual(tuple(output["mrto_event_pair_weights"].shape), (2, 3, 5, 5))
 
 
 if __name__ == "__main__":
