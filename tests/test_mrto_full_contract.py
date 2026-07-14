@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import torch
 
@@ -17,7 +18,7 @@ from rfm.models.task_models import (
     ReactionPropertyRegressor,
     load_stage_a_checkpoint,
 )
-from rfm.tasks.masked_edit import edit_set_matching_loss
+from rfm.tasks.masked_edit import compute_loss, edit_set_matching_loss
 
 
 def pair_valid(batch: int, atoms: int) -> torch.Tensor:
@@ -254,7 +255,28 @@ class MRTOFullContractTest(unittest.TestCase):
                 "coordinates_R": coordinates,
             }
         )
-        loss = sum(value.float().square().mean() for value in output.values() if torch.is_tensor(value))
+        valid = pair_valid(batch, atoms)
+        delta_bo = torch.zeros(batch, atoms, atoms)
+        delta_bo[:, 0, 1] = delta_bo[:, 1, 0] = 1.0
+        training_batch = {
+            "delta_bo": delta_bo,
+            "changed": delta_bo.abs(),
+            "edit_class": delta_bo.long(),
+            "core_atom": torch.tensor([[1, 1, 0, 0, 0]] * batch, dtype=torch.float32),
+            "loss_mask": valid.float(),
+            "pair_valid": valid,
+            "atom_mask": atom_mask,
+        }
+        args = SimpleNamespace(
+            delta_bo_weight=1.0,
+            changed_weight=0.5,
+            edit_weight=0.5,
+            core_weight=0.2,
+            mrto_event_set_weight=0.0,
+            mrto_event_diversity_weight=0.0,
+            mrto_edit_set_weight=0.1,
+        )
+        loss, _ = compute_loss(output, training_batch, args, torch.ones(4))
         loss.backward()
         missing = [
             name

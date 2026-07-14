@@ -36,6 +36,10 @@ The event bottleneck predicts an unordered edit set through event presence,
 pair location, and signed bond-order change. Exact slot-permutation matching is
 used for the small configured slot count.
 
+Stage A heads receive `reaction_h` as global context in addition to atom/pair
+states. This makes the reaction-level readout part of the actual Stage A loss
+graph instead of leaving it as an unsupervised output-only projection.
+
 Frozen Suiren features are input priors. Atom priors condition atom fields and
 graph priors condition event fields inside every operator block with parity-aware
 AdaLN/FiLM gates. They are not concatenated after the encoder and do not change
@@ -77,4 +81,3 @@ export PYTHONPATH=${RFM_CODE}:${BASE}/Suiren-Foundation-Model/src
 ```
 
 The environment also requires PyTorch Geometric, `torch-cluster`, and `e3nn`.
-

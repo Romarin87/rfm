@@ -163,13 +163,22 @@ class MRTOParityEnergyHead(nn.Module):
 class MaskedEditHeads(nn.Module):
     """Masked Delta_BO, changed pair, edit class, and core atom heads."""
 
-    def __init__(self, hidden_dim: int, router_residual: bool = False, router_gate_init: float = 0.05):
+    def __init__(
+        self,
+        hidden_dim: int,
+        router_residual: bool = False,
+        router_gate_init: float = 0.05,
+        reaction_context: bool = False,
+    ):
         super().__init__()
         self.router_residual = bool(router_residual)
-        self.delta_head = nn.Sequential(nn.LayerNorm(hidden_dim * 3), nn.Linear(hidden_dim * 3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
-        self.changed_head = nn.Sequential(nn.LayerNorm(hidden_dim * 3), nn.Linear(hidden_dim * 3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
-        self.edit_head = nn.Sequential(nn.LayerNorm(hidden_dim * 3), nn.Linear(hidden_dim * 3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, len(EDIT_CLASSES)))
-        self.core_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        self.reaction_context = bool(reaction_context)
+        pair_dim = hidden_dim * (4 if self.reaction_context else 3)
+        atom_dim = hidden_dim * (2 if self.reaction_context else 1)
+        self.delta_head = nn.Sequential(nn.LayerNorm(pair_dim), nn.Linear(pair_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        self.changed_head = nn.Sequential(nn.LayerNorm(pair_dim), nn.Linear(pair_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        self.edit_head = nn.Sequential(nn.LayerNorm(pair_dim), nn.Linear(pair_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, len(EDIT_CLASSES)))
+        self.core_head = nn.Sequential(nn.LayerNorm(atom_dim), nn.Linear(atom_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
         if self.router_residual:
             if not 0.0 < router_gate_init < 1.0:
                 raise ValueError(f"router_gate_init must be in (0,1), got {router_gate_init}")
@@ -190,6 +199,7 @@ class MaskedEditHeads(nn.Module):
         atom_h: torch.Tensor,
         pair_h: torch.Tensor,
         *,
+        reaction_h: torch.Tensor | None = None,
         router_atom_logits: torch.Tensor | None = None,
         router_pair_logits: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
@@ -197,8 +207,16 @@ class MaskedEditHeads(nn.Module):
         h_i = atom_h.unsqueeze(2).expand(batch, n_atoms, n_atoms, hidden)
         h_j = atom_h.unsqueeze(1).expand(batch, n_atoms, n_atoms, hidden)
         pair_repr = torch.cat([h_i, h_j, pair_h], dim=-1)
+        atom_repr = atom_h
+        if self.reaction_context:
+            if reaction_h is None:
+                raise ValueError("reaction-context masked-edit heads require reaction_h")
+            pair_context = reaction_h[:, None, None, :].expand(batch, n_atoms, n_atoms, hidden)
+            atom_context = reaction_h[:, None, :].expand(batch, n_atoms, hidden)
+            pair_repr = torch.cat([pair_repr, pair_context], dim=-1)
+            atom_repr = torch.cat([atom_h, atom_context], dim=-1)
         changed_logits = self.changed_head(pair_repr).squeeze(-1)
-        core_logits = self.core_head(atom_h).squeeze(-1)
+        core_logits = self.core_head(atom_repr).squeeze(-1)
         out: dict[str, torch.Tensor] = {
             "delta_bo": self.delta_head(pair_repr).squeeze(-1),
             "changed_logits": changed_logits,
@@ -232,6 +250,7 @@ def _masked_edit_outputs(heads: MaskedEditHeads, encoded: dict[str, torch.Tensor
     return heads(
         encoded["atom_h"],
         encoded["pair_h"],
+        reaction_h=encoded["reaction_h"],
         router_atom_logits=router_atom_logits,
         router_pair_logits=router_pair_logits,
     )
@@ -374,6 +393,7 @@ class MaskedEditPretrainingModel(nn.Module):
             router_residual=(encoder_type == "radar" and radar_center_router)
             or encoder_type in {"mrto", "mrto_v1", "mrto_full"},
             router_gate_init=radar_router_gate_init,
+            reaction_context=encoder_type == "mrto_full",
         )
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -577,6 +597,7 @@ class ReactionPropertyRegressor(nn.Module):
             router_residual=(encoder_type == "radar" and radar_center_router)
             or encoder_type in {"mrto", "mrto_v1", "mrto_full"},
             router_gate_init=radar_router_gate_init,
+            reaction_context=encoder_type == "mrto_full",
         )
         self.atom_readout = AtomAttentionReadout(hidden_dim) if attention_readout else None
         self.property_output_is_raw = encoder_type == "mrto_full"
@@ -844,6 +865,7 @@ class SuirenFusionPropertyRegressor(nn.Module):
             router_residual=(encoder_type == "radar" and radar_center_router)
             or encoder_type in {"mrto_v1", "mrto_full"},
             router_gate_init=radar_router_gate_init,
+            reaction_context=encoder_type == "mrto_full",
         )
         self.atom_readout = AtomAttentionReadout(hidden_dim) if attention_readout else None
         self.property_output_is_raw = encoder_type == "mrto_full"
