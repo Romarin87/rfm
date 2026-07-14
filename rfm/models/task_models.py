@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from rfm.data.reaction_samples import EDIT_CLASSES, ENERGY_TARGETS
 from rfm.features.mrto import MRTOReactionEncoder, MRTOReactionInputAdapter
+from rfm.features.mrto_full import MRTOFullReactionEncoder, MRTOFullReactionInputAdapter
 from rfm.features.mrto_v1 import MRTOv1ReactionEncoder, MRTOv1ReactionInputAdapter
 from rfm.features.radar import RADARReactionEncoder, RADARReactionInputAdapter
 from rfm.features.token_space import (
@@ -50,6 +51,17 @@ def _concat_mrto_v1_inputs(first: RFMEncoderInput, second: RFMEncoderInput) -> R
         context_first = torch.zeros_like(first.reaction_token)
     if context_second is None:
         context_second = torch.zeros_like(second.reaction_token)
+
+    def concat_optional(key: str, first_default: torch.Tensor, second_default: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            [first.metadata.get(key, first_default), second.metadata.get(key, second_default)],
+            dim=0,
+        )
+
+    first_atom_zero = torch.zeros_like(first.metadata["mrto_atom_fields"]["a_plus"])
+    second_atom_zero = torch.zeros_like(second.metadata["mrto_atom_fields"]["a_plus"])
+    first_graph_zero = torch.zeros_like(first.reaction_token)
+    second_graph_zero = torch.zeros_like(second.reaction_token)
     out = RFMEncoderInput(
         atom_tokens=torch.cat([first.atom_tokens, second.atom_tokens], dim=0),
         pair_tokens=torch.cat([first.pair_tokens, second.pair_tokens], dim=0),
@@ -59,7 +71,7 @@ def _concat_mrto_v1_inputs(first: RFMEncoderInput, second: RFMEncoderInput) -> R
         modality_mask=modality,
         task_name="joint_property_masked_edit",
         metadata={
-            "encoder_family": "mrto_v1",
+            "encoder_family": first.metadata.get("encoder_family", "mrto_v1"),
             "mrto_atom_fields": concat_field("mrto_atom_fields"),
             "mrto_pair_fields": concat_field("mrto_pair_fields"),
             "mrto_operator_pair_mask": torch.cat(
@@ -67,6 +79,23 @@ def _concat_mrto_v1_inputs(first: RFMEncoderInput, second: RFMEncoderInput) -> R
                 dim=0,
             ),
             "mrto_context_minus": torch.cat([context_first, context_second], dim=0),
+            "mrto_suiren_atom_plus": concat_optional(
+                "mrto_suiren_atom_plus", first_atom_zero, second_atom_zero
+            ),
+            "mrto_suiren_atom_minus": concat_optional(
+                "mrto_suiren_atom_minus", first_atom_zero, second_atom_zero
+            ),
+            "mrto_suiren_graph_plus": concat_optional(
+                "mrto_suiren_graph_plus", first_graph_zero, second_graph_zero
+            ),
+            "mrto_suiren_graph_minus": concat_optional(
+                "mrto_suiren_graph_minus", first_graph_zero, second_graph_zero
+            ),
+            "mrto_suiren_present": concat_optional(
+                "mrto_suiren_present",
+                torch.zeros(batch_first, dtype=torch.bool, device=first.atom_tokens.device),
+                torch.zeros(batch_second, dtype=torch.bool, device=second.atom_tokens.device),
+            ),
         },
     )
     out.validate()
@@ -103,6 +132,32 @@ class AtomAttentionReadout(nn.Module):
         weights = torch.softmax(scores, dim=1)
         value = self.value(atom_h)
         return (weights.unsqueeze(-1) * value).sum(dim=1)
+
+
+class MRTOParityEnergyHead(nn.Module):
+    """Predict odd reaction energy and even symmetric barrier in raw units."""
+
+    def __init__(self, hidden_dim: int, dropout: float):
+        super().__init__()
+        self.energy_odd = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1, bias=False),
+        )
+        self.symmetric_barrier_even = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, encoded: dict[str, torch.Tensor]) -> torch.Tensor:
+        d_e = self.energy_odd(encoded["mrto_reaction_minus"]).squeeze(-1)
+        symmetric_barrier = self.symmetric_barrier_even(encoded["mrto_reaction_plus"]).squeeze(-1)
+        d_e_dagger = symmetric_barrier + 0.5 * d_e
+        return torch.stack([d_e, d_e_dagger], dim=-1)
 
 
 class MaskedEditHeads(nn.Module):
@@ -215,13 +270,31 @@ class MaskedEditPretrainingModel(nn.Module):
         mrto_event_topk: int = 0,
         mrto_event_feedback_scale: float = 0.5,
         mrto_geometry_rbf_bins: int = 16,
+        mrto_equiformer_layers: int = 2,
+        mrto_equiformer_channels: int = 32,
+        mrto_equiformer_lmax: int = 2,
+        mrto_equiformer_radius: float = 5.0,
+        mrto_equiformer_max_neighbors: int = 64,
     ):
         super().__init__()
         self.encoder_type = encoder_type
-        if encoder_type == "mrto_v1":
+        if encoder_type in {"mrto_v1", "mrto_full"}:
             if not mrto_use_event_slots:
-                raise ValueError("encoder_type='mrto_v1' requires event slots")
-            self.adapter = MRTOv1ReactionInputAdapter(
+                raise ValueError(f"encoder_type={encoder_type!r} requires event slots")
+            adapter_class = MRTOFullReactionInputAdapter if encoder_type == "mrto_full" else MRTOv1ReactionInputAdapter
+            encoder_class = MRTOFullReactionEncoder if encoder_type == "mrto_full" else MRTOv1ReactionEncoder
+            full_adapter_kwargs = (
+                {
+                    "equiformer_layers": mrto_equiformer_layers,
+                    "equiformer_channels": mrto_equiformer_channels,
+                    "equiformer_lmax": mrto_equiformer_lmax,
+                    "equiformer_radius": mrto_equiformer_radius,
+                    "equiformer_max_neighbors": mrto_equiformer_max_neighbors,
+                }
+                if encoder_type == "mrto_full"
+                else {}
+            )
+            self.adapter = adapter_class(
                 hidden_dim=hidden_dim,
                 pair_input_dim=pair_raw_dim,
                 input_schema=input_schema,
@@ -230,8 +303,9 @@ class MaskedEditPretrainingModel(nn.Module):
                 endpoint_layers=mrto_endpoint_layers,
                 geometry_rbf_bins=mrto_geometry_rbf_bins,
                 dropout=dropout,
+                **full_adapter_kwargs,
             )
-            self.encoder = MRTOv1ReactionEncoder(
+            self.encoder = encoder_class(
                 hidden_dim=hidden_dim,
                 layers=layers,
                 dropout=dropout,
@@ -298,7 +372,7 @@ class MaskedEditPretrainingModel(nn.Module):
         self.masked_edit_heads = MaskedEditHeads(
             hidden_dim,
             router_residual=(encoder_type == "radar" and radar_center_router)
-            or encoder_type in {"mrto", "mrto_v1"},
+            or encoder_type in {"mrto", "mrto_v1", "mrto_full"},
             router_gate_init=radar_router_gate_init,
         )
 
@@ -313,6 +387,8 @@ class MaskedEditPretrainingModel(nn.Module):
             "mrto_event_minus",
             "mrto_reaction_plus",
             "mrto_reaction_minus",
+            "mrto_event_presence_logits",
+            "mrto_event_delta_bo",
         ):
             if key in encoded:
                 out[key] = encoded[key]
@@ -358,19 +434,26 @@ class ReactionPropertyRegressor(nn.Module):
         mrto_event_topk: int = 0,
         mrto_event_feedback_scale: float = 0.5,
         mrto_geometry_rbf_bins: int = 16,
+        mrto_equiformer_layers: int = 2,
+        mrto_equiformer_channels: int = 32,
+        mrto_equiformer_lmax: int = 2,
+        mrto_equiformer_radius: float = 5.0,
+        mrto_equiformer_max_neighbors: int = 64,
         joint_encoder_pass: bool = False,
     ):
         super().__init__()
         masked_schema, masked_pair_raw_dim = _masked_edit_schema_for_property(input_schema)
         self.encoder_type = encoder_type
         self.joint_encoder_pass = bool(joint_encoder_pass)
-        if self.joint_encoder_pass and encoder_type != "mrto_v1":
-            raise ValueError("joint_encoder_pass is currently supported only by encoder_type='mrto_v1'")
-        if encoder_type == "mrto_v1":
+        if self.joint_encoder_pass and encoder_type not in {"mrto_v1", "mrto_full"}:
+            raise ValueError("joint_encoder_pass requires encoder_type='mrto_v1' or 'mrto_full'")
+        if encoder_type in {"mrto_v1", "mrto_full"}:
             if directional_3d_adapter:
                 raise ValueError("directional_3d_adapter is only supported by encoder_type='token_space'")
             if not mrto_use_event_slots:
-                raise ValueError("encoder_type='mrto_v1' requires event slots")
+                raise ValueError(f"encoder_type={encoder_type!r} requires event slots")
+            adapter_class = MRTOFullReactionInputAdapter if encoder_type == "mrto_full" else MRTOv1ReactionInputAdapter
+            encoder_class = MRTOFullReactionEncoder if encoder_type == "mrto_full" else MRTOv1ReactionEncoder
             adapter_kwargs = {
                 "hidden_dim": hidden_dim,
                 "use_odd_field": mrto_use_odd_field,
@@ -378,19 +461,30 @@ class ReactionPropertyRegressor(nn.Module):
                 "geometry_rbf_bins": mrto_geometry_rbf_bins,
                 "dropout": dropout,
             }
-            self.adapter = MRTOv1ReactionInputAdapter(
+            if encoder_type == "mrto_full":
+                adapter_kwargs.update(
+                    equiformer_layers=mrto_equiformer_layers,
+                    equiformer_channels=mrto_equiformer_channels,
+                    equiformer_lmax=mrto_equiformer_lmax,
+                    equiformer_radius=mrto_equiformer_radius,
+                    equiformer_max_neighbors=mrto_equiformer_max_neighbors,
+                )
+            self.adapter = adapter_class(
                 pair_input_dim=pair_raw_dim,
                 input_schema=input_schema,
                 task_name="property",
                 **adapter_kwargs,
             )
-            self.masked_adapter = MRTOv1ReactionInputAdapter(
+            masked_adapter_kwargs = dict(adapter_kwargs)
+            if encoder_type == "mrto_full":
+                masked_adapter_kwargs["equiformer_adapter"] = self.adapter.equivariant_geometry
+            self.masked_adapter = adapter_class(
                 pair_input_dim=masked_pair_raw_dim,
                 input_schema=masked_schema,
                 task_name="masked_edit",
-                **adapter_kwargs,
+                **masked_adapter_kwargs,
             )
-            self.encoder = MRTOv1ReactionEncoder(
+            self.encoder = encoder_class(
                 hidden_dim=hidden_dim,
                 layers=layers,
                 dropout=dropout,
@@ -481,16 +575,21 @@ class ReactionPropertyRegressor(nn.Module):
         self.masked_edit_heads = MaskedEditHeads(
             hidden_dim,
             router_residual=(encoder_type == "radar" and radar_center_router)
-            or encoder_type in {"mrto", "mrto_v1"},
+            or encoder_type in {"mrto", "mrto_v1", "mrto_full"},
             router_gate_init=radar_router_gate_init,
         )
         self.atom_readout = AtomAttentionReadout(hidden_dim) if attention_readout else None
-        self.reg_head = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, len(ENERGY_TARGETS)),
+        self.property_output_is_raw = encoder_type == "mrto_full"
+        self.reg_head = (
+            MRTOParityEnergyHead(hidden_dim, dropout)
+            if self.property_output_is_raw
+            else nn.Sequential(
+                nn.LayerNorm(hidden_dim * 2),
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, len(ENERGY_TARGETS)),
+            )
         )
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -509,18 +608,26 @@ class ReactionPropertyRegressor(nn.Module):
             atom_pool = masked_h.sum(dim=1) / atom_mask.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
         else:
             atom_pool = self.atom_readout(atom_h, atom_mask, encoded["reaction_h"])
-        y = self.reg_head(torch.cat([encoded["reaction_h"], atom_pool], dim=-1))
+        y = (
+            self.reg_head(encoded)
+            if self.property_output_is_raw
+            else self.reg_head(torch.cat([encoded["reaction_h"], atom_pool], dim=-1))
+        )
 
         out = {
             "y": y,
             "reaction_h": encoded["reaction_h"],
         }
+        if self.property_output_is_raw:
+            out["y_is_raw"] = True
         for key in (
             "mrto_event_pair_weights",
             "mrto_event_plus",
             "mrto_event_minus",
             "mrto_reaction_plus",
             "mrto_reaction_minus",
+            "mrto_event_presence_logits",
+            "mrto_event_delta_bo",
         ):
             if key in encoded:
                 out[key] = encoded[key]
@@ -535,12 +642,15 @@ class ReactionPropertyRegressor(nn.Module):
 
     @staticmethod
     def _masked_batch(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        return {
+        out = {
             "z": batch["z"],
             "atom_mask": batch["atom_mask"],
             "pair_input": batch["masked_pair_input"],
             "pair_valid": batch["masked_pair_valid"],
         }
+        if "coordinates_R" in batch:
+            out["coordinates_R"] = batch["coordinates_R"]
+        return out
 
     def _masked_outputs(self, encoded: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         out = _masked_edit_outputs(self.masked_edit_heads, encoded)
@@ -551,6 +661,8 @@ class ReactionPropertyRegressor(nn.Module):
             "mrto_event_minus",
             "mrto_reaction_plus",
             "mrto_reaction_minus",
+            "mrto_event_presence_logits",
+            "mrto_event_delta_bo",
         ):
             if key in encoded:
                 out[key] = encoded[key]
@@ -601,19 +713,26 @@ class SuirenFusionPropertyRegressor(nn.Module):
         mrto_event_topk: int = 0,
         mrto_event_feedback_scale: float = 0.5,
         mrto_geometry_rbf_bins: int = 16,
+        mrto_equiformer_layers: int = 2,
+        mrto_equiformer_channels: int = 32,
+        mrto_equiformer_lmax: int = 2,
+        mrto_equiformer_radius: float = 5.0,
+        mrto_equiformer_max_neighbors: int = 64,
         joint_encoder_pass: bool = False,
     ):
         super().__init__()
         masked_schema, masked_pair_raw_dim = _masked_edit_schema_for_property(input_schema)
         self.encoder_type = encoder_type
         self.joint_encoder_pass = bool(joint_encoder_pass)
-        if self.joint_encoder_pass and encoder_type != "mrto_v1":
-            raise ValueError("joint_encoder_pass is currently supported only by encoder_type='mrto_v1'")
-        if encoder_type == "mrto_v1":
+        if self.joint_encoder_pass and encoder_type not in {"mrto_v1", "mrto_full"}:
+            raise ValueError("joint_encoder_pass requires encoder_type='mrto_v1' or 'mrto_full'")
+        if encoder_type in {"mrto_v1", "mrto_full"}:
             if directional_3d_adapter:
                 raise ValueError("directional_3d_adapter is only supported by encoder_type='token_space'")
             if not mrto_use_event_slots:
-                raise ValueError("encoder_type='mrto_v1' requires event slots")
+                raise ValueError(f"encoder_type={encoder_type!r} requires event slots")
+            adapter_class = MRTOFullReactionInputAdapter if encoder_type == "mrto_full" else MRTOv1ReactionInputAdapter
+            encoder_class = MRTOFullReactionEncoder if encoder_type == "mrto_full" else MRTOv1ReactionEncoder
             adapter_kwargs = {
                 "hidden_dim": hidden_dim,
                 "use_odd_field": mrto_use_odd_field,
@@ -621,7 +740,15 @@ class SuirenFusionPropertyRegressor(nn.Module):
                 "geometry_rbf_bins": mrto_geometry_rbf_bins,
                 "dropout": dropout,
             }
-            self.input_adapter = MRTOv1ReactionInputAdapter(
+            if encoder_type == "mrto_full":
+                adapter_kwargs.update(
+                    equiformer_layers=mrto_equiformer_layers,
+                    equiformer_channels=mrto_equiformer_channels,
+                    equiformer_lmax=mrto_equiformer_lmax,
+                    equiformer_radius=mrto_equiformer_radius,
+                    equiformer_max_neighbors=mrto_equiformer_max_neighbors,
+                )
+            self.input_adapter = adapter_class(
                 pair_input_dim=pair_raw_dim,
                 input_schema=input_schema,
                 task_name="suiren_fusion_property",
@@ -632,13 +759,16 @@ class SuirenFusionPropertyRegressor(nn.Module):
                 enable_suiren_gates=enable_suiren_input_gates,
                 **adapter_kwargs,
             )
-            self.masked_adapter = MRTOv1ReactionInputAdapter(
+            masked_adapter_kwargs = dict(adapter_kwargs)
+            if encoder_type == "mrto_full":
+                masked_adapter_kwargs["equiformer_adapter"] = self.input_adapter.equivariant_geometry
+            self.masked_adapter = adapter_class(
                 pair_input_dim=masked_pair_raw_dim,
                 input_schema=masked_schema,
                 task_name="masked_edit",
-                **adapter_kwargs,
+                **masked_adapter_kwargs,
             )
-            self.encoder = MRTOv1ReactionEncoder(
+            self.encoder = encoder_class(
                 hidden_dim=hidden_dim,
                 layers=layers,
                 dropout=dropout,
@@ -711,16 +841,22 @@ class SuirenFusionPropertyRegressor(nn.Module):
             raise ValueError(f"unsupported encoder_type={encoder_type!r}")
         self.masked_edit_heads = MaskedEditHeads(
             hidden_dim,
-            router_residual=(encoder_type == "radar" and radar_center_router) or encoder_type == "mrto_v1",
+            router_residual=(encoder_type == "radar" and radar_center_router)
+            or encoder_type in {"mrto_v1", "mrto_full"},
             router_gate_init=radar_router_gate_init,
         )
         self.atom_readout = AtomAttentionReadout(hidden_dim) if attention_readout else None
-        self.reg_head = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, len(ENERGY_TARGETS)),
+        self.property_output_is_raw = encoder_type == "mrto_full"
+        self.reg_head = (
+            MRTOParityEnergyHead(hidden_dim, dropout)
+            if self.property_output_is_raw
+            else nn.Sequential(
+                nn.LayerNorm(hidden_dim * 2),
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, len(ENERGY_TARGETS)),
+            )
         )
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -743,18 +879,26 @@ class SuirenFusionPropertyRegressor(nn.Module):
             atom_pool = masked_h.sum(dim=1) / atom_mask.sum(dim=1).clamp_min(1).float().unsqueeze(-1)
         else:
             atom_pool = self.atom_readout(atom_h, atom_mask, encoded["reaction_h"])
-        y = self.reg_head(torch.cat([encoded["reaction_h"], atom_pool], dim=-1))
+        y = (
+            self.reg_head(encoded)
+            if self.property_output_is_raw
+            else self.reg_head(torch.cat([encoded["reaction_h"], atom_pool], dim=-1))
+        )
 
         out = {
             "y": y,
             "reaction_h": encoded["reaction_h"],
         }
+        if self.property_output_is_raw:
+            out["y_is_raw"] = True
         for key in (
             "mrto_event_pair_weights",
             "mrto_event_plus",
             "mrto_event_minus",
             "mrto_reaction_plus",
             "mrto_reaction_minus",
+            "mrto_event_presence_logits",
+            "mrto_event_delta_bo",
         ):
             if key in encoded:
                 out[key] = encoded[key]
@@ -769,12 +913,15 @@ class SuirenFusionPropertyRegressor(nn.Module):
 
     @staticmethod
     def _masked_batch(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        return {
+        out = {
             "z": batch["z"],
             "atom_mask": batch["atom_mask"],
             "pair_input": batch["masked_pair_input"],
             "pair_valid": batch["masked_pair_valid"],
         }
+        if "coordinates_R" in batch:
+            out["coordinates_R"] = batch["coordinates_R"]
+        return out
 
     def _masked_outputs(self, encoded: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         out = _masked_edit_outputs(self.masked_edit_heads, encoded)

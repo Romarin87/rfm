@@ -13,6 +13,12 @@ dependencies = [
   "torch",
 ]
 
+[project.optional-dependencies]
+mrto-full = [
+  "e3nn",
+  "torch-geometric",
+]
+
 [tool.setuptools]
 package-dir = {"" = "."}
 

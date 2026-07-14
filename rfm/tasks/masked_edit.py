@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from functools import lru_cache
+from itertools import permutations
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from rfm.data.reaction_samples import EDIT_CLASSES, load_split, masked_edit_pair_input
+from rfm.data.reaction_samples import EDIT_CLASSES, coordinates, load_split, masked_edit_pair_input
 from rfm.tasks.metrics import binary_f1, macro_f1, mean_absolute_error, safe_auroc
 from rfm.utils.runtime import move_to_device
 
@@ -30,7 +32,7 @@ class MaskedEditDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         sample = self.samples[idx]
         pair = masked_edit_pair_input(sample, idx, self.args)
-        return {
+        item = {
             "reaction_id": sample["reaction_id"],
             "z": np.asarray(sample["atomic_numbers"], dtype=np.int64),
             "pair_input": pair["pair_input"],
@@ -43,6 +45,9 @@ class MaskedEditDataset(Dataset):
             "core_atom": pair["core_atom"],
             "n_atoms": len(sample["atomic_numbers"]),
         }
+        if self.args.geometry_mode == "irc_rp":
+            item["coordinates_R"] = coordinates(sample, "R")
+        return item
 
 
 def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -60,6 +65,11 @@ def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     changed = torch.zeros((batch_size, max_n, max_n), dtype=torch.float32)
     edit_class = torch.zeros((batch_size, max_n, max_n), dtype=torch.long)
     reaction_ids: list[str] = []
+    coordinates_r = (
+        torch.zeros((batch_size, max_n, 3), dtype=torch.float32)
+        if "coordinates_R" in batch[0]
+        else None
+    )
 
     for row, item in enumerate(batch):
         n_atoms = item["n_atoms"]
@@ -74,8 +84,10 @@ def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         changed[row, :n_atoms, :n_atoms] = torch.from_numpy(item["changed"])
         edit_class[row, :n_atoms, :n_atoms] = torch.from_numpy(item["edit_class"])
         reaction_ids.append(item["reaction_id"])
+        if coordinates_r is not None:
+            coordinates_r[row, :n_atoms] = torch.from_numpy(item["coordinates_R"])
 
-    return {
+    out = {
         "reaction_id": reaction_ids,
         "z": z,
         "atom_mask": atom_mask,
@@ -88,6 +100,9 @@ def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "changed": changed,
         "edit_class": edit_class,
     }
+    if coordinates_r is not None:
+        out["coordinates_R"] = coordinates_r
+    return out
 
 
 def target_upper(batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -160,6 +175,84 @@ def event_set_losses(
     return set_loss, diversity_loss
 
 
+@lru_cache(maxsize=8)
+def _slot_permutations(slots: int) -> tuple[tuple[int, ...], ...]:
+    if slots > 6:
+        raise ValueError("exact edit-set matching supports at most six event slots")
+    return tuple(permutations(range(slots)))
+
+
+def edit_set_matching_loss(
+    event_pair_weights: torch.Tensor | None,
+    event_presence_logits: torch.Tensor | None,
+    event_delta_bo: torch.Tensor | None,
+    batch: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Exact permutation-invariant matching for the sparse masked edit set."""
+
+    if event_pair_weights is None or event_presence_logits is None or event_delta_bo is None:
+        return batch["delta_bo"].new_zeros(())
+    batch_size, slots, n_atoms, n_atoms_2 = event_pair_weights.shape
+    if n_atoms != n_atoms_2:
+        raise ValueError("mrto_event_pair_weights must be square in its atom dimensions")
+    if event_presence_logits.shape != (batch_size, slots):
+        raise ValueError("mrto_event_presence_logits must be [B,K]")
+    if event_delta_bo.shape != (batch_size, slots):
+        raise ValueError("mrto_event_delta_bo must be [B,K]")
+
+    target_mask = (batch["changed"] > 0.5) & target_upper(batch)
+    flat_target = target_mask.reshape(batch_size, -1)
+    flat_delta = batch["delta_bo"].reshape(batch_size, -1)
+    target_score = torch.where(
+        flat_target,
+        2.0 + flat_delta.abs(),
+        flat_delta.new_full(flat_delta.shape, -1.0e6),
+    )
+    _, target_index = target_score.topk(slots, dim=1)
+    target_exists = flat_target.gather(1, target_index)
+    target_delta = flat_delta.gather(1, target_index)
+
+    flat_weights = event_pair_weights.reshape(batch_size, slots, -1)
+    location_probability = flat_weights.gather(
+        2,
+        target_index.unsqueeze(1).expand(-1, slots, -1),
+    ).clamp_min(1e-8)
+    location_cost = -location_probability.log() * target_exists.unsqueeze(1)
+    delta_cost = F.smooth_l1_loss(
+        event_delta_bo.unsqueeze(2).expand(-1, -1, slots),
+        target_delta.unsqueeze(1).expand(-1, slots, -1),
+        reduction="none",
+    ) * target_exists.unsqueeze(1)
+    presence_target = target_exists.to(dtype=event_presence_logits.dtype).unsqueeze(1).expand(-1, slots, -1)
+    presence_cost = F.binary_cross_entropy_with_logits(
+        event_presence_logits.unsqueeze(2).expand(-1, -1, slots),
+        presence_target,
+        reduction="none",
+    )
+    cost = location_cost + 0.25 * delta_cost + 0.25 * presence_cost
+
+    assignments = torch.tensor(
+        _slot_permutations(slots),
+        dtype=torch.long,
+        device=cost.device,
+    )
+    n_assignments = assignments.shape[0]
+    expanded_cost = cost.unsqueeze(1).expand(-1, n_assignments, -1, -1)
+    selected = expanded_cost.gather(
+        3,
+        assignments.view(1, n_assignments, slots, 1).expand(batch_size, -1, -1, -1),
+    ).squeeze(-1)
+    assignment_cost = selected.sum(dim=-1)
+    best_assignment = assignment_cost.detach().argmin(dim=1)
+    matched = assignment_cost.gather(1, best_assignment.unsqueeze(1)).mean() / float(slots)
+
+    # Retain coverage for the rare reaction containing more edits than slots.
+    union_probability = flat_weights.sum(dim=1).clamp(1e-8, 1.0)
+    target_float = flat_target.to(dtype=union_probability.dtype)
+    coverage = -(union_probability.log() * target_float).sum() / target_float.sum().clamp_min(1.0)
+    return matched + 0.25 * coverage
+
+
 def compute_loss(
     out: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
@@ -172,6 +265,12 @@ def compute_loss(
     edit_loss = F.cross_entropy(out["edit_logits"][mask], batch["edit_class"][mask], weight=edit_class_weights)
     core_loss = F.binary_cross_entropy_with_logits(out["core_logits"][batch["atom_mask"]], batch["core_atom"][batch["atom_mask"]])
     event_set_loss, event_diversity_loss = event_set_losses(out.get("mrto_event_pair_weights"), batch)
+    edit_set_loss = edit_set_matching_loss(
+        out.get("mrto_event_pair_weights"),
+        out.get("mrto_event_presence_logits"),
+        out.get("mrto_event_delta_bo"),
+        batch,
+    )
     loss = (
         args.delta_bo_weight * delta_loss
         + args.changed_weight * changed_loss
@@ -179,6 +278,7 @@ def compute_loss(
         + args.core_weight * core_loss
         + float(getattr(args, "mrto_event_set_weight", 0.0)) * event_set_loss
         + float(getattr(args, "mrto_event_diversity_weight", 0.0)) * event_diversity_loss
+        + float(getattr(args, "mrto_edit_set_weight", 0.0)) * edit_set_loss
     )
     return loss, {
         "delta_bo_loss": float(delta_loss.detach().cpu()),
@@ -187,6 +287,7 @@ def compute_loss(
         "core_loss": float(core_loss.detach().cpu()),
         "event_set_loss": float(event_set_loss.detach().cpu()),
         "event_diversity_loss": float(event_diversity_loss.detach().cpu()),
+        "edit_set_matching_loss": float(edit_set_loss.detach().cpu()),
     }
 
 
@@ -207,6 +308,7 @@ def train_one_epoch(
         "core_loss": 0.0,
         "event_set_loss": 0.0,
         "event_diversity_loss": 0.0,
+        "edit_set_matching_loss": 0.0,
         "n": 0.0,
     }
     accumulation_steps = max(int(getattr(args, "gradient_accumulation_steps", 1)), 1)
@@ -255,6 +357,7 @@ def evaluate_loss(
         "core_loss": 0.0,
         "event_set_loss": 0.0,
         "event_diversity_loss": 0.0,
+        "edit_set_matching_loss": 0.0,
         "n": 0.0,
     }
     for batch in loader:

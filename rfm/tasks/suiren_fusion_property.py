@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from rfm.data.reaction_samples import ENERGY_TARGETS, load_split, masked_edit_pair_input, reaction_property_pair_input, target_vector
+from rfm.data.reaction_samples import ENERGY_TARGETS, coordinates, load_split, masked_edit_pair_input, reaction_property_pair_input, target_vector
 from rfm.tasks import reaction_property
 
 
@@ -309,6 +309,9 @@ class SuirenFusionPropertyDataset(Dataset):
             "n_atoms": len(sample["atomic_numbers"]),
             "core_size": int(pair["core_atom"].sum()),
         }
+        if self.args.geometry_mode == "irc_rp":
+            item["coordinates_R"] = coordinates(sample, "R")
+            item["coordinates_P"] = coordinates(sample, "P")
         for stream, store in self.graph_stores.items():
             features, failed = store.get(idx, reaction_id)
             if features is not None:

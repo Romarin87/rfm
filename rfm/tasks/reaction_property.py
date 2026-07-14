@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from rfm.data.reaction_samples import EDIT_CLASSES, ENERGY_TARGETS, load_split, masked_edit_pair_input, reaction_property_pair_input, target_vector
+from rfm.data.reaction_samples import EDIT_CLASSES, ENERGY_TARGETS, coordinates, load_split, masked_edit_pair_input, reaction_property_pair_input, target_vector
 from rfm.tasks import masked_edit
 from rfm.tasks.metrics import binary_f1, macro_f1, mean_absolute_error, regression_metrics, safe_auroc
 from rfm.utils.runtime import move_to_device
@@ -41,7 +41,7 @@ class ReactionPropertyDataset(Dataset):
         pair = reaction_property_pair_input(sample, self.args)
         masked_pair = masked_edit_pair_input(sample, idx, self.args)
         core_size = int(pair["core_atom"].sum())
-        return {
+        item = {
             "reaction_id": sample["reaction_id"],
             "z": np.asarray(sample["atomic_numbers"], dtype=np.int64),
             "pair_input": pair["pair_input"],
@@ -60,6 +60,10 @@ class ReactionPropertyDataset(Dataset):
             "n_atoms": len(sample["atomic_numbers"]),
             "core_size": core_size,
         }
+        if self.args.geometry_mode == "irc_rp":
+            item["coordinates_R"] = coordinates(sample, "R")
+            item["coordinates_P"] = coordinates(sample, "P")
+        return item
 
 
 def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -85,6 +89,12 @@ def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     n_atoms: list[int] = []
     core_size: list[int] = []
     reaction_ids: list[str] = []
+    coordinates_r = (
+        torch.zeros((batch_size, max_n, 3), dtype=torch.float32)
+        if "coordinates_R" in batch[0]
+        else None
+    )
+    coordinates_p = torch.zeros_like(coordinates_r) if coordinates_r is not None else None
 
     for row, item in enumerate(batch):
         n = item["n_atoms"]
@@ -106,8 +116,11 @@ def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         n_atoms.append(n)
         core_size.append(item["core_size"])
         reaction_ids.append(item["reaction_id"])
+        if coordinates_r is not None and coordinates_p is not None:
+            coordinates_r[row, :n] = torch.from_numpy(item["coordinates_R"])
+            coordinates_p[row, :n] = torch.from_numpy(item["coordinates_P"])
 
-    return {
+    out = {
         "reaction_id": reaction_ids,
         "z": z,
         "pair_input": pair_input,
@@ -127,6 +140,10 @@ def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "n_atoms": torch.tensor(n_atoms, dtype=torch.long),
         "core_size": torch.tensor(core_size, dtype=torch.long),
     }
+    if coordinates_r is not None and coordinates_p is not None:
+        out["coordinates_R"] = coordinates_r
+        out["coordinates_P"] = coordinates_p
+    return out
 
 
 def target_stats(dataset: ReactionPropertyDataset) -> tuple[torch.Tensor, torch.Tensor]:
@@ -162,8 +179,10 @@ def masked_out_view(out: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         prefixed_key = f"masked_{key}"
         if prefixed_key in out:
             masked_out[key] = out[prefixed_key]
-    if "masked_mrto_event_pair_weights" in out:
-        masked_out["mrto_event_pair_weights"] = out["masked_mrto_event_pair_weights"]
+    for key in ("mrto_event_pair_weights", "mrto_event_presence_logits", "mrto_event_delta_bo"):
+        prefixed_key = f"masked_{key}"
+        if prefixed_key in out:
+            masked_out[key] = out[prefixed_key]
     return masked_out
 
 
@@ -190,11 +209,12 @@ def compute_loss(
     args: Any,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     y_norm = (batch["y"] - y_mean) / y_std
-    property_loss = F.mse_loss(out["y"], y_norm)
+    y_pred_norm = (out["y"] - y_mean) / y_std if out.get("y_is_raw", False) else out["y"]
+    property_loss = F.mse_loss(y_pred_norm, y_norm)
     stage_a_loss, stage_a_parts = masked_edit.compute_loss(masked_out_view(out), masked_batch_view(batch), args, edit_class_weights(args, batch["y"].device))
     stage_a_weight = float(getattr(args, "stage_a_weight", 0.5))
     prop_weight = property_loss_weight(args)
-    consistency_loss = forward_reverse_consistency_loss(out["y"], batch.get("reaction_id", []), y_mean, y_std)
+    consistency_loss = forward_reverse_consistency_loss(y_pred_norm, batch.get("reaction_id", []), y_mean, y_std)
     consistency_weight = float(getattr(args, "forward_reverse_consistency_weight", 0.0))
     loss = stage_a_weight * stage_a_loss + prop_weight * property_loss + consistency_weight * consistency_loss
     return loss, {
@@ -258,6 +278,7 @@ def train_one_epoch(
         "core_loss": 0.0,
         "event_set_loss": 0.0,
         "event_diversity_loss": 0.0,
+        "edit_set_matching_loss": 0.0,
         "n": 0.0,
     }
     accumulation_steps = max(int(getattr(args, "gradient_accumulation_steps", 1)), 1)
@@ -324,6 +345,7 @@ def evaluate_loss(model: torch.nn.Module, loader: Any, y_mean: torch.Tensor, y_s
         "core_loss": 0.0,
         "event_set_loss": 0.0,
         "event_diversity_loss": 0.0,
+        "edit_set_matching_loss": 0.0,
         "n": 0.0,
     }
     for batch in loader:
@@ -354,7 +376,7 @@ def evaluate(model: torch.nn.Module, loader: Any, y_mean: torch.Tensor, y_std: t
     for batch in loader:
         batch = move_to_device(batch, device)
         out = model(batch)
-        pred = out["y"] * y_std + y_mean
+        pred = out["y"] if out.get("y_is_raw", False) else out["y"] * y_std + y_mean
         y_true.append(batch["y"].detach().cpu().numpy())
         y_pred.append(pred.detach().cpu().numpy())
         masked_batch = masked_batch_view(batch)
@@ -428,7 +450,8 @@ def predict_rows(model: torch.nn.Module, loader: Any, y_mean: torch.Tensor, y_st
     for batch in loader:
         batch = move_to_device(batch, device)
         out = model(batch)
-        pred = (out["y"] * y_std + y_mean).detach().cpu().numpy()
+        pred_tensor = out["y"] if out.get("y_is_raw", False) else out["y"] * y_std + y_mean
+        pred = pred_tensor.detach().cpu().numpy()
         true = batch["y"].detach().cpu().numpy()
         for reaction_id, y_true, y_hat in zip(batch["reaction_id"], true, pred):
             rows.append(

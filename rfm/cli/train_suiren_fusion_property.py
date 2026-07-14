@@ -62,7 +62,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--encoder-type", choices=("token_space", "radar", "mrto_v1"), default="token_space")
+    parser.add_argument("--encoder-type", choices=("token_space", "radar", "mrto_v1", "mrto_full"), default="token_space")
     parser.add_argument("--radar-attention-heads", type=int, default=8)
     parser.add_argument("--radar-center-router", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--radar-delta-stream", action=argparse.BooleanOptionalAction, default=True)
@@ -82,8 +82,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mrto-event-topk", type=int, default=0)
     parser.add_argument("--mrto-event-feedback-scale", type=float, default=0.5)
     parser.add_argument("--mrto-geometry-rbf-bins", type=int, default=16)
+    parser.add_argument("--mrto-equiformer-layers", type=int, default=2)
+    parser.add_argument("--mrto-equiformer-channels", type=int, default=32)
+    parser.add_argument("--mrto-equiformer-lmax", type=int, default=2)
+    parser.add_argument("--mrto-equiformer-radius", type=float, default=5.0)
+    parser.add_argument("--mrto-equiformer-max-neighbors", type=int, default=64)
     parser.add_argument("--mrto-event-set-weight", type=float, default=0.0)
     parser.add_argument("--mrto-event-diversity-weight", type=float, default=0.0)
+    parser.add_argument("--mrto-edit-set-weight", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--geometry-mode", choices=("2d", "irc_rp"), default="2d")
     parser.add_argument("--stage-a-weight", type=float, default=0.5)
@@ -247,6 +253,8 @@ def cache_manifest(args: argparse.Namespace, train_ds: Any, valid_ds: Any, test_
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.encoder_type == "mrto_full" and args.mrto_event_topk == 0:
+        args.mrto_event_topk = 16
     rank, world, local_rank = setup_ddp()
     set_seed(args.seed + rank)
     device = resolve_device(args.device, local_rank)
@@ -364,6 +372,11 @@ def main(argv: list[str] | None = None) -> None:
         mrto_event_topk=args.mrto_event_topk,
         mrto_event_feedback_scale=args.mrto_event_feedback_scale,
         mrto_geometry_rbf_bins=args.mrto_geometry_rbf_bins,
+        mrto_equiformer_layers=args.mrto_equiformer_layers,
+        mrto_equiformer_channels=args.mrto_equiformer_channels,
+        mrto_equiformer_lmax=args.mrto_equiformer_lmax,
+        mrto_equiformer_radius=args.mrto_equiformer_radius,
+        mrto_equiformer_max_neighbors=args.mrto_equiformer_max_neighbors,
         joint_encoder_pass=args.joint_encoder_pass,
     ).to(device)
     if args.pretrained_stage_a and args.pretrained_encoder:
@@ -371,7 +384,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.pretrained_stage_a:
         load_stage_a_checkpoint(model, args.pretrained_stage_a, device)
     elif args.pretrained_encoder:
-        if args.encoder_type in {"radar", "mrto_v1"}:
+        if args.encoder_type in {"radar", "mrto_v1", "mrto_full"}:
             raise ValueError(f"{args.encoder_type} Stage C requires --pretrained-stage-a so the adapter and edit heads are restored")
         load_pretrained_encoder(model, args.pretrained_encoder, device)
     if args.freeze_encoder:
@@ -552,12 +565,18 @@ def main(argv: list[str] | None = None) -> None:
                     "event_topk": args.mrto_event_topk,
                     "event_feedback_scale": args.mrto_event_feedback_scale,
                     "geometry_rbf_bins": args.mrto_geometry_rbf_bins,
+                    "equiformer_layers": args.mrto_equiformer_layers,
+                    "equiformer_channels": args.mrto_equiformer_channels,
+                    "equiformer_lmax": args.mrto_equiformer_lmax,
+                    "equiformer_radius": args.mrto_equiformer_radius,
+                    "equiformer_max_neighbors": args.mrto_equiformer_max_neighbors,
                     "event_set_weight": args.mrto_event_set_weight,
                     "event_diversity_weight": args.mrto_event_diversity_weight,
+                    "edit_set_weight": args.mrto_edit_set_weight,
                 },
                 "suiren_input_semantics": {
-                    "graph_features": "initial_reaction_or_event_context_input_projection",
-                    "atom_features": "endpoint_atom_state_input_projection_aligned_by_atom_map_order",
+                    "graph_features": "per-block event-slot conditioning for mrto_full",
+                    "atom_features": "per-block atom-field AdaLN/FiLM conditioning for mrto_full",
                     "mrto_parity": "R/P shared state projection with even abs-delta and odd signed-delta fields",
                     "suiren_pair_tokens": False,
                     "encoder_output_shape_fixed": True,

@@ -23,5 +23,6 @@ pyproject.toml
 ## Interface Docs
 
 - `docs/CODE_STRUCTURE.md`
+- `docs/MRTO_FULL_ARCHITECTURE.md`
 - `docs/HDF5_PROCESSED_SCHEMA.md`
 - `docs/ATOM_LEVEL_SUIREN_FEATURE_SCHEMA.md`

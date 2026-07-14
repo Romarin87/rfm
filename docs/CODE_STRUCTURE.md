@@ -12,6 +12,8 @@ rfm/
     reaction_samples.py    # HDF5 sample 读取、raw pair_input 与 target 组装
   features/
     token_space.py         # 派生特征、ReactionInputFeaturizer、adapter、RFMEncoderInput
+    mrto_v1.py             # exact R/P even-odd fields and parity primitives
+    mrto_full.py           # EquiformerV2 endpoints, sparse events, full MRTO operator
   models/
     task_models.py         # masked edit / reaction property regression 模型封装
   optim/
@@ -102,6 +104,11 @@ active processed HDF5 只写 IRC R/P endpoint 坐标，不写 `coordinates_TS`�
 Suiren cache 训练/评估前必须验证 `failed.sum() == 0`；failed row 不能作为合法零特征进入模型。
 Reaction Encoder 输出接口固定为 `atom_h: [B,N,H]`、`pair_h: [B,N,N,H]`、
 `reaction_h: [B,H]`；property head / masked-edit heads 不随 Suiren feature 组合改变输入维度。
+
+完整 MRTO 实现见 `docs/MRTO_FULL_ARCHITECTURE.md`。`mrto_full` 使用一套共享的
+EquiformerV2 endpoint adapter 处理 R/P 独立坐标系，在主干内保持严格 R/P swap
+even/odd fields，并通过 competitive sparse event slots 读写 atom/pair fields。Stage C
+的 Suiren atom/graph 特征在每层算子内部作 parity-aware input conditioning，不是输出旁路。
 
 ## 4. Checkpoint Rule
 
