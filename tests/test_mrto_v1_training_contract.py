@@ -397,6 +397,43 @@ class MRTOv1TrainingContractTest(unittest.TestCase):
         for key in expected:
             torch.testing.assert_close(expected[key], actual[key], atol=3e-5, rtol=3e-5)
 
+    def test_suiren_masked_outputs_preserve_edit_set_predictions(self) -> None:
+        model = SuirenFusionPropertyRegressor(
+            4,
+            32,
+            1,
+            0.0,
+            "property_irc_rp_bo",
+            encoder_type="mrto_full",
+            mrto_attention_heads=4,
+            mrto_event_slots=4,
+            mrto_event_topk=4,
+            mrto_endpoint_layers=1,
+            mrto_triangle_layers=1,
+            mrto_triangle_dim=8,
+            mrto_equiformer_layers=1,
+            mrto_equiformer_channels=8,
+            mrto_equiformer_lmax=1,
+        )
+        batch_size, n_atoms, event_slots = 2, 5, 4
+        encoded = {
+            "atom_h": torch.randn(batch_size, n_atoms, 32),
+            "pair_h": torch.randn(batch_size, n_atoms, n_atoms, 32),
+            "reaction_h": torch.randn(batch_size, 32),
+            "mrto_center_atom_logits": torch.randn(batch_size, n_atoms),
+            "mrto_center_pair_logits": torch.randn(batch_size, n_atoms, n_atoms),
+            "mrto_event_pair_weights": torch.randn(batch_size, event_slots, n_atoms, n_atoms),
+            "mrto_event_presence_logits": torch.randn(batch_size, event_slots),
+            "mrto_event_delta_bo": torch.randn(batch_size, event_slots),
+        }
+        output = model._masked_outputs(encoded)
+        for key in (
+            "mrto_event_pair_weights",
+            "mrto_event_presence_logits",
+            "mrto_event_delta_bo",
+        ):
+            self.assertIs(output[key], encoded[key])
+
 
 if __name__ == "__main__":
     unittest.main()

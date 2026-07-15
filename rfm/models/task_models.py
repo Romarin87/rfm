@@ -954,6 +954,8 @@ class SuirenFusionPropertyRegressor(nn.Module):
             "mrto_event_minus",
             "mrto_reaction_plus",
             "mrto_reaction_minus",
+            "mrto_event_presence_logits",
+            "mrto_event_delta_bo",
         ):
             if key in encoded:
                 out[key] = encoded[key]
