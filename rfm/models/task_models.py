@@ -91,8 +91,13 @@ def _concat_mrto_v1_inputs(first: RFMEncoderInput, second: RFMEncoderInput) -> R
             "mrto_suiren_graph_minus": concat_optional(
                 "mrto_suiren_graph_minus", first_graph_zero, second_graph_zero
             ),
-            "mrto_suiren_present": concat_optional(
-                "mrto_suiren_present",
+            "mrto_suiren_atom_present": concat_optional(
+                "mrto_suiren_atom_present",
+                torch.zeros(batch_first, dtype=torch.bool, device=first.atom_tokens.device),
+                torch.zeros(batch_second, dtype=torch.bool, device=second.atom_tokens.device),
+            ),
+            "mrto_suiren_graph_present": concat_optional(
+                "mrto_suiren_graph_present",
                 torch.zeros(batch_first, dtype=torch.bool, device=first.atom_tokens.device),
                 torch.zeros(batch_second, dtype=torch.bool, device=second.atom_tokens.device),
             ),
@@ -288,6 +293,7 @@ class MaskedEditPretrainingModel(nn.Module):
         mrto_triangle_scale: float = 0.5,
         mrto_event_topk: int = 0,
         mrto_event_feedback_scale: float = 0.5,
+        mrto_prior_gate_init: float = 0.1,
         mrto_geometry_rbf_bins: int = 16,
         mrto_equiformer_layers: int = 2,
         mrto_equiformer_channels: int = 32,
@@ -336,6 +342,7 @@ class MaskedEditPretrainingModel(nn.Module):
                 pair_update_scale=mrto_pair_update_scale,
                 event_topk=mrto_event_topk,
                 event_feedback_scale=mrto_event_feedback_scale,
+                **({"prior_gate_init": mrto_prior_gate_init} if encoder_type == "mrto_full" else {}),
             )
         elif encoder_type == "mrto":
             self.adapter = MRTOReactionInputAdapter(
@@ -733,6 +740,7 @@ class SuirenFusionPropertyRegressor(nn.Module):
         mrto_triangle_scale: float = 0.5,
         mrto_event_topk: int = 0,
         mrto_event_feedback_scale: float = 0.5,
+        mrto_prior_gate_init: float = 0.1,
         mrto_geometry_rbf_bins: int = 16,
         mrto_equiformer_layers: int = 2,
         mrto_equiformer_channels: int = 32,
@@ -801,6 +809,7 @@ class SuirenFusionPropertyRegressor(nn.Module):
                 pair_update_scale=mrto_pair_update_scale,
                 event_topk=mrto_event_topk,
                 event_feedback_scale=mrto_event_feedback_scale,
+                **({"prior_gate_init": mrto_prior_gate_init} if encoder_type == "mrto_full" else {}),
             )
         elif encoder_type == "radar":
             if directional_3d_adapter:
@@ -961,6 +970,10 @@ class SuirenFusionPropertyRegressor(nn.Module):
                 out[key] = encoded[key]
         return out
 
+    def suiren_prior_gate_values(self) -> list[dict[str, float | int]]:
+        values = getattr(self.encoder, "suiren_prior_gate_values", None)
+        return values() if values is not None else []
+
     def _masked_forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         encoded = self.encoder(self.masked_adapter(self._masked_batch(batch)))
         return self._masked_outputs(encoded)
@@ -1019,7 +1032,24 @@ def load_stage_a_checkpoint(model: nn.Module, path: str, device: torch.device) -
 
     if not hasattr(model, "masked_adapter") or not hasattr(model, "masked_edit_heads"):
         raise TypeError("target model must expose masked_adapter and masked_edit_heads")
-    model.encoder.load_state_dict(component("encoder"), strict=True)
+    encoder_state = component("encoder")
+    input_adapter = getattr(model, "input_adapter", None)
+    has_suiren_inputs = bool(
+        input_adapter is not None
+        and (
+            getattr(input_adapter, "suiren_atom_dims", {})
+            or getattr(input_adapter, "suiren_graph_dims", {})
+        )
+    )
+    if isinstance(model.encoder, MRTOFullReactionEncoder) and has_suiren_inputs:
+        initialized_conditioner = {
+            key: value.detach().clone()
+            for key, value in model.encoder.state_dict().items()
+            if ".prior_conditioner." in key
+        }
+        encoder_state = dict(encoder_state)
+        encoder_state.update(initialized_conditioner)
+    model.encoder.load_state_dict(encoder_state, strict=True)
     model.masked_adapter.load_state_dict(component("adapter"), strict=True)
     model.masked_edit_heads.load_state_dict(component("masked_edit_heads"), strict=True)
     return checkpoint

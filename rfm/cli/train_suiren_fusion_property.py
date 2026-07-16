@@ -81,6 +81,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mrto-triangle-scale", type=float, default=0.5)
     parser.add_argument("--mrto-event-topk", type=int, default=0)
     parser.add_argument("--mrto-event-feedback-scale", type=float, default=0.5)
+    parser.add_argument("--mrto-prior-gate-init", type=float, default=0.1)
     parser.add_argument("--mrto-geometry-rbf-bins", type=int, default=16)
     parser.add_argument("--mrto-equiformer-layers", type=int, default=2)
     parser.add_argument("--mrto-equiformer-channels", type=int, default=32)
@@ -371,6 +372,7 @@ def main(argv: list[str] | None = None) -> None:
         mrto_triangle_scale=args.mrto_triangle_scale,
         mrto_event_topk=args.mrto_event_topk,
         mrto_event_feedback_scale=args.mrto_event_feedback_scale,
+        mrto_prior_gate_init=args.mrto_prior_gate_init,
         mrto_geometry_rbf_bins=args.mrto_geometry_rbf_bins,
         mrto_equiformer_layers=args.mrto_equiformer_layers,
         mrto_equiformer_channels=args.mrto_equiformer_channels,
@@ -425,6 +427,7 @@ def main(argv: list[str] | None = None) -> None:
                 "valid_loss": valid_loss,
                 "valid": valid_metrics,
                 "router_gates": model.masked_edit_heads.router_gate_values(),
+                "suiren_prior_gates": model.suiren_prior_gate_values(),
             }
             history.append(row)
             print(json.dumps(row, ensure_ascii=False), flush=True)
@@ -478,6 +481,7 @@ def main(argv: list[str] | None = None) -> None:
             "early_stop_patience": args.early_stop_patience,
             "early_stop_min_delta": args.early_stop_min_delta,
             "router_gates": model.masked_edit_heads.router_gate_values(),
+            "suiren_prior_gates": model.suiren_prior_gate_values(),
             "model_improvement_switches": {
                 "encoder_type": args.encoder_type,
                 "radar_attention_heads": args.radar_attention_heads,
@@ -495,6 +499,7 @@ def main(argv: list[str] | None = None) -> None:
                 "mrto_triangle_scale": args.mrto_triangle_scale,
                 "mrto_event_topk": args.mrto_event_topk,
                 "mrto_event_feedback_scale": args.mrto_event_feedback_scale,
+                "mrto_prior_gate_init": args.mrto_prior_gate_init,
                 "suiren_input_gates": args.enable_suiren_input_gates,
                 "dynamic_pair_update": args.enable_dynamic_pair_update,
                 "dynamic_pair_update_scale": args.dynamic_pair_update_scale,

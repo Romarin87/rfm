@@ -432,6 +432,12 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
             self.suiren_feature_key(stream, "graph") in batch for stream in self.suiren_graph_state_projection
         )
         has_suiren = bool(has_suiren_atom or has_suiren_graph)
+        suiren_atom_present = torch.full(
+            (z.shape[0],), has_suiren_atom, dtype=torch.bool, device=z.device
+        )
+        suiren_graph_present = torch.full(
+            (z.shape[0],), has_suiren_graph, dtype=torch.bool, device=z.device
+        )
         modality = self.modality_dict(
             z.shape[0],
             z.device,
@@ -494,7 +500,8 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
                 "mrto_suiren_atom_minus": suiren_atom_prior_odd,
                 "mrto_suiren_graph_plus": suiren_graph_even,
                 "mrto_suiren_graph_minus": suiren_graph_odd,
-                "mrto_suiren_present": modality["has_Suiren_R"],
+                "mrto_suiren_atom_present": suiren_atom_present,
+                "mrto_suiren_graph_present": suiren_graph_present,
                 "suiren_atom_dims": self.suiren_atom_dims,
                 "suiren_atom_state_dims": self.suiren_atom_state_dims,
                 "suiren_graph_dims": self.suiren_graph_dims,

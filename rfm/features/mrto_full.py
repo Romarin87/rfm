@@ -8,6 +8,7 @@ presence, and signed bond-order change predictions.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -145,7 +146,7 @@ class MRTOFullReactionInputAdapter(MRTOv1ReactionInputAdapter):
         **kwargs,
     ):
         kwargs["enable_distance_geometry"] = False
-        kwargs["inject_suiren_initial"] = False
+        kwargs["inject_suiren_initial"] = True
         super().__init__(*args, **kwargs)
         has_geometry = self.featurizer.spec.has_r_3d or self.featurizer.spec.has_p_3d
         if equiformer_adapter is not None and not has_geometry:
@@ -351,16 +352,19 @@ class MRTOFullCenterState:
 class ParityPriorConditioner(nn.Module):
     """AdaLN/FiLM-style Suiren prior conditioning inside an MRTO block."""
 
-    def __init__(self, hidden_dim: int, dropout: float):
+    def __init__(self, hidden_dim: int, dropout: float, gate_init: float):
         super().__init__()
+        if not 0.0 <= gate_init < 1.0:
+            raise ValueError(f"Suiren prior gate_init must be in [0,1), got {gate_init}")
         self.atom_even = _even_mlp(hidden_dim * 2, hidden_dim * 2, dropout)
         self.atom_odd = OddMLP(hidden_dim * 2, hidden_dim, dropout)
         self.atom_plus_norm = nn.LayerNorm(hidden_dim)
         self.atom_minus_norm = OddRMSNorm(hidden_dim)
         self.graph_even = _even_mlp(hidden_dim * 2, hidden_dim, dropout)
         self.graph_odd = OddMLP(hidden_dim * 2, hidden_dim, dropout)
-        self.atom_gate = nn.Parameter(torch.zeros(()))
-        self.event_gate = nn.Parameter(torch.zeros(()))
+        raw_gate_init = math.atanh(gate_init)
+        self.atom_gate = nn.Parameter(torch.tensor(raw_gate_init))
+        self.event_gate = nn.Parameter(torch.tensor(raw_gate_init))
 
     def forward(
         self,
@@ -372,7 +376,8 @@ class ParityPriorConditioner(nn.Module):
         prior_atom_minus: torch.Tensor,
         prior_graph_plus: torch.Tensor,
         prior_graph_minus: torch.Tensor,
-        prior_present: torch.Tensor,
+        prior_atom_present: torch.Tensor,
+        prior_graph_present: torch.Tensor,
         atom_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         atom_even_context = torch.cat([prior_atom_plus, prior_atom_minus.square()], dim=-1)
@@ -380,7 +385,7 @@ class ParityPriorConditioner(nn.Module):
         odd_shift = self.atom_odd(
             torch.cat([prior_atom_minus, prior_atom_plus * prior_atom_minus], dim=-1)
         )
-        present_atom = prior_present.to(dtype=atom_plus.dtype).view(-1, 1, 1)
+        present_atom = prior_atom_present.to(dtype=atom_plus.dtype).view(-1, 1, 1)
         atom_scale = torch.tanh(self.atom_gate) * present_atom
         atom_plus = atom_plus + atom_scale * (
             torch.tanh(gamma) * self.atom_plus_norm(atom_plus) + beta
@@ -393,7 +398,7 @@ class ParityPriorConditioner(nn.Module):
         graph_odd_context = torch.cat(
             [prior_graph_minus, prior_graph_plus * prior_graph_minus], dim=-1
         )
-        present_event = prior_present.to(dtype=event_plus.dtype).view(-1, 1, 1)
+        present_event = prior_graph_present.to(dtype=event_plus.dtype).view(-1, 1, 1)
         event_scale = torch.tanh(self.event_gate) * present_event
         event_plus = event_plus + event_scale * self.graph_even(graph_even_context).unsqueeze(1)
         event_minus = event_minus + event_scale * self.graph_odd(graph_odd_context).unsqueeze(1)
@@ -416,10 +421,11 @@ class MRTOFullTransitionBlock(nn.Module):
         pair_update_scale: float,
         event_topk: int,
         event_feedback_scale: float,
+        prior_gate_init: float,
     ):
         super().__init__()
         self.pair_update_scale = float(pair_update_scale)
-        self.prior_conditioner = ParityPriorConditioner(hidden_dim, dropout)
+        self.prior_conditioner = ParityPriorConditioner(hidden_dim, dropout, prior_gate_init)
         self.triangle = LowRankParityTriangle(hidden_dim, triangle_dim, dropout, triangle_scale) if use_triangle else None
         self.atom_attention = ParityAtomAttention(hidden_dim, heads, dropout)
         self.pair_plus_update = _even_mlp(hidden_dim * 4, hidden_dim, dropout)
@@ -453,7 +459,8 @@ class MRTOFullTransitionBlock(nn.Module):
         prior_atom_minus: torch.Tensor,
         prior_graph_plus: torch.Tensor,
         prior_graph_minus: torch.Tensor,
-        prior_present: torch.Tensor,
+        prior_atom_present: torch.Tensor,
+        prior_graph_present: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, MRTOFullCenterState]:
         atom_plus, atom_minus, event_plus, event_minus = self.prior_conditioner(
             atom_plus,
@@ -464,7 +471,8 @@ class MRTOFullTransitionBlock(nn.Module):
             prior_atom_minus,
             prior_graph_plus,
             prior_graph_minus,
-            prior_present,
+            prior_atom_present,
+            prior_graph_present,
             atom_mask,
         )
         if self.triangle is not None:
@@ -530,6 +538,7 @@ class MRTOFullReactionEncoder(nn.Module):
         pair_update_scale: float = 0.75,
         event_topk: int = 16,
         event_feedback_scale: float = 0.5,
+        prior_gate_init: float = 0.1,
     ):
         super().__init__()
         if event_slots < 1:
@@ -550,6 +559,7 @@ class MRTOFullReactionEncoder(nn.Module):
                     pair_update_scale,
                     event_topk,
                     event_feedback_scale,
+                    prior_gate_init,
                 )
                 for index in range(layers)
             ]
@@ -595,8 +605,12 @@ class MRTOFullReactionEncoder(nn.Module):
         prior_graph_minus = encoder_input.metadata.get(
             "mrto_suiren_graph_minus", torch.zeros_like(encoder_input.reaction_token)
         )
-        prior_present = encoder_input.metadata.get(
-            "mrto_suiren_present",
+        prior_atom_present = encoder_input.metadata.get(
+            "mrto_suiren_atom_present",
+            torch.zeros(batch, dtype=torch.bool, device=atom_plus.device),
+        )
+        prior_graph_present = encoder_input.metadata.get(
+            "mrto_suiren_graph_present",
             torch.zeros(batch, dtype=torch.bool, device=atom_plus.device),
         )
 
@@ -616,7 +630,8 @@ class MRTOFullReactionEncoder(nn.Module):
                 prior_atom_minus,
                 prior_graph_plus,
                 prior_graph_minus,
-                prior_present,
+                prior_atom_present,
+                prior_graph_present,
             )
 
         atom_plus_out = self.atom_plus_out(torch.cat([atom_plus, atom_minus.square()], dim=-1))
@@ -668,3 +683,13 @@ class MRTOFullReactionEncoder(nn.Module):
             out["mrto_center_pair_logits"] = center.pair_logits
             out["mrto_event_pair_weights"] = center.event_pair_weights
         return out
+
+    def suiren_prior_gate_values(self) -> list[dict[str, float | int]]:
+        return [
+            {
+                "layer": index,
+                "atom": float(torch.tanh(block.prior_conditioner.atom_gate).detach().cpu()),
+                "graph_event": float(torch.tanh(block.prior_conditioner.event_gate).detach().cpu()),
+            }
+            for index, block in enumerate(self.layers)
+        ]

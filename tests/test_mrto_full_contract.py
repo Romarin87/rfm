@@ -16,6 +16,7 @@ from rfm.models.task_models import (
     MRTOParityEnergyHead,
     MaskedEditPretrainingModel,
     ReactionPropertyRegressor,
+    SuirenFusionPropertyRegressor,
     load_stage_a_checkpoint,
 )
 from rfm.tasks.masked_edit import compute_loss, edit_set_matching_loss
@@ -221,6 +222,153 @@ class MRTOFullContractTest(unittest.TestCase):
             atol=8e-5,
             rtol=8e-5,
         )
+
+    def test_suiren_atom_features_enter_initial_tokens_and_receive_first_step_gradients(self) -> None:
+        torch.manual_seed(13)
+        batch = property_batch()
+        batch["pair_input"] = batch["pair_input"][..., :2]
+        batch.pop("coordinates_R")
+        batch.pop("coordinates_P")
+        atom_r = torch.randn(2, 5, 4)
+        atom_p = torch.randn(2, 5, 4)
+        batch["suiren_3d_atom_features"] = torch.cat(
+            [atom_r, atom_p, atom_p - atom_r, (atom_p - atom_r).abs()], dim=-1
+        )
+        zero_batch = dict(batch)
+        zero_batch["suiren_3d_atom_features"] = torch.zeros_like(batch["suiren_3d_atom_features"])
+        adapter = MRTOFullReactionInputAdapter(
+            hidden_dim=16,
+            pair_input_dim=2,
+            input_schema="property_rp2d_bo",
+            task_name="suiren_fusion_property",
+            endpoint_layers=1,
+            suiren_atom_dims={"3d": 16},
+            dropout=0.0,
+        )
+        encoder = MRTOFullReactionEncoder(
+            16,
+            1,
+            0.0,
+            attention_heads=4,
+            event_slots=4,
+            triangle_layers=1,
+            triangle_dim=8,
+            event_topk=4,
+            prior_gate_init=0.1,
+        )
+
+        actual_input = adapter(batch)
+        zero_input = adapter(zero_batch)
+        self.assertGreater(
+            float(
+                (
+                    actual_input.metadata["mrto_atom_fields"]["a_plus"]
+                    - zero_input.metadata["mrto_atom_fields"]["a_plus"]
+                )
+                .abs()
+                .max()
+            ),
+            1e-5,
+        )
+        output = encoder(actual_input)
+        loss = output["reaction_h"].square().mean() + output["atom_h"].square().mean()
+        loss.backward()
+        projection_grad = adapter.suiren_atom_state_projection["3d"][0].weight.grad
+        conditioner_grad = encoder.layers[0].prior_conditioner.atom_even[1].weight.grad
+        self.assertIsNotNone(projection_grad)
+        self.assertIsNotNone(conditioner_grad)
+        self.assertGreater(float(projection_grad.norm()), 0.0)
+        self.assertGreater(float(conditioner_grad.norm()), 0.0)
+
+    def test_atom_only_suiren_does_not_enable_graph_event_conditioner(self) -> None:
+        torch.manual_seed(17)
+        batch = property_batch()
+        batch["pair_input"] = batch["pair_input"][..., :2]
+        batch.pop("coordinates_R")
+        batch.pop("coordinates_P")
+        atom_r = torch.randn(2, 5, 4)
+        atom_p = torch.randn(2, 5, 4)
+        batch["suiren_3d_atom_features"] = torch.cat(
+            [atom_r, atom_p, atom_p - atom_r, (atom_p - atom_r).abs()], dim=-1
+        )
+        adapter = MRTOFullReactionInputAdapter(
+            hidden_dim=16,
+            pair_input_dim=2,
+            input_schema="property_rp2d_bo",
+            task_name="suiren_fusion_property",
+            endpoint_layers=1,
+            suiren_atom_dims={"3d": 16},
+            dropout=0.0,
+        ).eval()
+        encoder = MRTOFullReactionEncoder(
+            16,
+            1,
+            0.0,
+            attention_heads=4,
+            event_slots=4,
+            triangle_layers=1,
+            triangle_dim=8,
+            event_topk=4,
+            prior_gate_init=0.2,
+        ).eval()
+        clean_input = adapter(batch)
+        perturbed_input = adapter(batch)
+        self.assertTrue(bool(clean_input.metadata["mrto_suiren_atom_present"].all()))
+        self.assertFalse(bool(clean_input.metadata["mrto_suiren_graph_present"].any()))
+        perturbed_input.metadata["mrto_suiren_graph_plus"] = torch.randn_like(
+            perturbed_input.metadata["mrto_suiren_graph_plus"]
+        )
+        perturbed_input.metadata["mrto_suiren_graph_minus"] = torch.randn_like(
+            perturbed_input.metadata["mrto_suiren_graph_minus"]
+        )
+        with torch.no_grad():
+            clean = encoder(clean_input)
+            perturbed = encoder(perturbed_input)
+        torch.testing.assert_close(clean["mrto_event_plus"], perturbed["mrto_event_plus"])
+        torch.testing.assert_close(clean["mrto_event_minus"], perturbed["mrto_event_minus"])
+
+    def test_stage_a_checkpoint_does_not_overwrite_stage_c_suiren_conditioner(self) -> None:
+        common = {
+            "encoder_type": "mrto_full",
+            "mrto_attention_heads": 4,
+            "mrto_event_slots": 4,
+            "mrto_event_topk": 4,
+            "mrto_triangle_layers": 1,
+            "mrto_triangle_dim": 8,
+        }
+        stage_a = MaskedEditPretrainingModel(
+            3,
+            16,
+            1,
+            0.0,
+            "masked_edit_2d",
+            mrto_prior_gate_init=0.0,
+            **common,
+        )
+        stage_c = SuirenFusionPropertyRegressor(
+            2,
+            16,
+            1,
+            0.0,
+            "property_rp2d_bo",
+            suiren_atom_dims={"3d": 16},
+            mrto_prior_gate_init=0.2,
+            joint_encoder_pass=True,
+            **common,
+        )
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "model.pt"
+            torch.save(
+                {
+                    "model": stage_a.state_dict(),
+                    "config": {"encoder_type": "mrto_full"},
+                },
+                checkpoint,
+            )
+            load_stage_a_checkpoint(stage_c, str(checkpoint), torch.device("cpu"))
+        gates = stage_c.suiren_prior_gate_values()
+        self.assertAlmostEqual(gates[0]["atom"], 0.2, places=6)
+        self.assertAlmostEqual(gates[0]["graph_event"], 0.2, places=6)
 
     def test_stage_a_full_model_uses_all_trainable_parameters(self) -> None:
         torch.manual_seed(5)
