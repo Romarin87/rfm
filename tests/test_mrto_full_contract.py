@@ -327,6 +327,53 @@ class MRTOFullContractTest(unittest.TestCase):
         torch.testing.assert_close(clean["mrto_event_plus"], perturbed["mrto_event_plus"])
         torch.testing.assert_close(clean["mrto_event_minus"], perturbed["mrto_event_minus"])
 
+    def test_zero_init_conditioner_only_starts_feature_neutral_with_gate_gradients(self) -> None:
+        torch.manual_seed(23)
+        batch = property_batch()
+        batch["pair_input"] = batch["pair_input"][..., :2]
+        batch.pop("coordinates_R")
+        batch.pop("coordinates_P")
+        atom_r = torch.randn(2, 5, 4)
+        atom_p = torch.randn(2, 5, 4)
+        batch["suiren_3d_atom_features"] = torch.cat(
+            [atom_r, atom_p, atom_p - atom_r, (atom_p - atom_r).abs()], dim=-1
+        )
+        perturbed = {key: value.clone() for key, value in batch.items()}
+        perturbed["suiren_3d_atom_features"] = torch.randn_like(
+            perturbed["suiren_3d_atom_features"]
+        )
+        adapter = MRTOFullReactionInputAdapter(
+            hidden_dim=16,
+            pair_input_dim=2,
+            input_schema="property_rp2d_bo",
+            task_name="suiren_fusion_property",
+            endpoint_layers=1,
+            suiren_atom_dims={"3d": 16},
+            suiren_injection_mode="conditioner_only",
+            dropout=0.0,
+        )
+        encoder = MRTOFullReactionEncoder(
+            16,
+            1,
+            0.0,
+            attention_heads=4,
+            event_slots=4,
+            triangle_layers=1,
+            triangle_dim=8,
+            event_topk=4,
+            prior_gate_init=0.0,
+        )
+        output = encoder(adapter(batch))
+        perturbed_output = encoder(adapter(perturbed))
+        torch.testing.assert_close(output["reaction_h"], perturbed_output["reaction_h"])
+        torch.testing.assert_close(output["atom_h"], perturbed_output["atom_h"])
+
+        probe = torch.randn_like(output["atom_h"])
+        (output["atom_h"] * probe).sum().backward()
+        gate_grad = encoder.layers[0].prior_conditioner.atom_gate.grad
+        self.assertIsNotNone(gate_grad)
+        self.assertGreater(float(gate_grad.abs()), 0.0)
+
     def test_stage_a_checkpoint_does_not_overwrite_stage_c_suiren_conditioner(self) -> None:
         common = {
             "encoder_type": "mrto_full",

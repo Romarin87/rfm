@@ -105,6 +105,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--core-weight", type=float, default=0.2)
     parser.add_argument("--forward-reverse-consistency-weight", type=float, default=0.0)
     parser.add_argument("--enable-suiren-input-gates", action="store_true")
+    parser.add_argument("--suiren-input-gate-init", type=float, default=0.0)
+    parser.add_argument(
+        "--suiren-injection-mode",
+        choices=("both", "initial_only", "conditioner_only"),
+        default="both",
+    )
     parser.add_argument("--enable-dynamic-pair-update", action="store_true")
     parser.add_argument("--dynamic-pair-update-scale", type=float, default=1.0)
     parser.add_argument("--dynamic-pair-update-dropout", type=float, default=None)
@@ -254,6 +260,12 @@ def cache_manifest(args: argparse.Namespace, train_ds: Any, valid_ds: Any, test_
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.suiren_injection_mode != "both" and args.encoder_type != "mrto_full":
+        raise ValueError("single-location Suiren injection modes require --encoder-type mrto_full")
+    if args.suiren_injection_mode == "initial_only" and not args.enable_suiren_input_gates:
+        raise ValueError("initial_only requires --enable-suiren-input-gates for an explicit learnable gate")
+    if args.suiren_injection_mode == "conditioner_only" and args.enable_suiren_input_gates:
+        raise ValueError("conditioner_only must not enable the separate input gate")
     if args.encoder_type == "mrto_full" and args.mrto_event_topk == 0:
         args.mrto_event_topk = 16
     rank, world, local_rank = setup_ddp()
@@ -348,6 +360,8 @@ def main(argv: list[str] | None = None) -> None:
         suiren_atom_dims=train_ds.suiren_atom_dims,
         suiren_graph_dims=train_ds.suiren_graph_dims,
         enable_suiren_input_gates=args.enable_suiren_input_gates,
+        suiren_input_gate_init=args.suiren_input_gate_init,
+        suiren_injection_mode=args.suiren_injection_mode,
         dynamic_pair_update=args.enable_dynamic_pair_update,
         dynamic_pair_update_scale=args.dynamic_pair_update_scale,
         dynamic_pair_update_dropout=args.dynamic_pair_update_dropout,
@@ -427,6 +441,7 @@ def main(argv: list[str] | None = None) -> None:
                 "valid_loss": valid_loss,
                 "valid": valid_metrics,
                 "router_gates": model.masked_edit_heads.router_gate_values(),
+                "suiren_input_gates": model.suiren_input_gate_values(),
                 "suiren_prior_gates": model.suiren_prior_gate_values(),
             }
             history.append(row)
@@ -481,6 +496,7 @@ def main(argv: list[str] | None = None) -> None:
             "early_stop_patience": args.early_stop_patience,
             "early_stop_min_delta": args.early_stop_min_delta,
             "router_gates": model.masked_edit_heads.router_gate_values(),
+            "suiren_input_gates": model.suiren_input_gate_values(),
             "suiren_prior_gates": model.suiren_prior_gate_values(),
             "model_improvement_switches": {
                 "encoder_type": args.encoder_type,
@@ -501,6 +517,8 @@ def main(argv: list[str] | None = None) -> None:
                 "mrto_event_feedback_scale": args.mrto_event_feedback_scale,
                 "mrto_prior_gate_init": args.mrto_prior_gate_init,
                 "suiren_input_gates": args.enable_suiren_input_gates,
+                "suiren_input_gate_init": args.suiren_input_gate_init,
+                "suiren_injection_mode": args.suiren_injection_mode,
                 "dynamic_pair_update": args.enable_dynamic_pair_update,
                 "dynamic_pair_update_scale": args.dynamic_pair_update_scale,
                 "dynamic_pair_update_dropout": args.dynamic_pair_update_dropout,
@@ -634,6 +652,8 @@ def main(argv: list[str] | None = None) -> None:
                     "mrto_event_topk": args.mrto_event_topk,
                     "mrto_event_feedback_scale": args.mrto_event_feedback_scale,
                     "suiren_input_gates": args.enable_suiren_input_gates,
+                    "suiren_input_gate_init": args.suiren_input_gate_init,
+                    "suiren_injection_mode": args.suiren_injection_mode,
                     "dynamic_pair_update": args.enable_dynamic_pair_update,
                     "dynamic_pair_update_scale": args.dynamic_pair_update_scale,
                     "dynamic_pair_update_dropout": args.dynamic_pair_update_dropout,
@@ -660,7 +680,8 @@ def main(argv: list[str] | None = None) -> None:
                 f"stage_a_checkpoint={args.pretrained_stage_a or args.pretrained_encoder}; "
                 f"loss=0.5*L_A+1.0*L_C+{args.forward_reverse_consistency_weight}*L_FR; "
                 f"selection=minimum valid_loss; optimizer={args.optimizer}; suiren_dims={cache_info['dims']}; "
-                f"switches=gates:{args.enable_suiren_input_gates},dynamic_pair:{args.enable_dynamic_pair_update},"
+                f"switches=gates:{args.enable_suiren_input_gates},input_gate_init:{args.suiren_input_gate_init},"
+                f"suiren_injection:{args.suiren_injection_mode},dynamic_pair:{args.enable_dynamic_pair_update},"
                 f"dynamic_pair_scale:{args.dynamic_pair_update_scale},dynamic_pair_dropout:{args.dynamic_pair_update_dropout},"
                 f"attention_readout:{args.enable_attention_readout},directional_3d:{args.enable_directional_3d_adapter}"
             ),

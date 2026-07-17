@@ -7,6 +7,7 @@ and odd atom/pair/event fields through every block, and forms the public
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -171,7 +172,9 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
         suiren_atom_dims: dict[str, int] | None = None,
         suiren_graph_dims: dict[str, int] | None = None,
         enable_suiren_gates: bool = False,
+        suiren_gate_init: float = 0.0,
         inject_suiren_initial: bool = True,
+        include_suiren_modality_tokens: bool = True,
     ):
         super().__init__(hidden_dim, task_name=task_name)
         schema = input_schema or infer_pair_basis_schema(
@@ -183,7 +186,11 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
         self.geometry_neighbor_cutoff = float(geometry_neighbor_cutoff)
         self.enable_distance_geometry = bool(enable_distance_geometry)
         self.enable_suiren_gates = bool(enable_suiren_gates)
+        if not -1.0 < suiren_gate_init < 1.0:
+            raise ValueError(f"Suiren input gate init must be in (-1,1), got {suiren_gate_init}")
+        self.suiren_gate_init = float(suiren_gate_init)
         self.inject_suiren_initial = bool(inject_suiren_initial)
+        self.include_suiren_modality_tokens = bool(include_suiren_modality_tokens)
         self.suiren_atom_dims = dict(suiren_atom_dims or {})
         self.suiren_graph_dims = dict(suiren_graph_dims or {})
         if suiren_atom_dim > 0 and not self.suiren_atom_dims:
@@ -255,11 +262,12 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
                 for name, dim in sorted(self.suiren_graph_state_dims.items())
             }
         )
+        raw_gate_init = math.atanh(self.suiren_gate_init)
         self.suiren_atom_gate_logits = nn.ParameterDict(
-            {name: nn.Parameter(torch.zeros(())) for name in self.suiren_atom_state_projection}
+            {name: nn.Parameter(torch.tensor(raw_gate_init)) for name in self.suiren_atom_state_projection}
         )
         self.suiren_graph_gate_logits = nn.ParameterDict(
-            {name: nn.Parameter(torch.zeros(())) for name in self.suiren_graph_state_projection}
+            {name: nn.Parameter(torch.tensor(raw_gate_init)) for name in self.suiren_graph_state_projection}
         )
 
     @staticmethod
@@ -272,7 +280,21 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
         if not self.enable_suiren_gates:
             return self.z_embedding.weight.new_ones(())
         logits = self.suiren_atom_gate_logits[stream] if level == "atom" else self.suiren_graph_gate_logits[stream]
-        return 2.0 * torch.sigmoid(logits)
+        return torch.tanh(logits)
+
+    def suiren_input_gate_values(self) -> dict[str, dict[str, float]]:
+        if not self.enable_suiren_gates:
+            return {}
+        return {
+            "atom": {
+                stream: float(torch.tanh(value).detach().cpu())
+                for stream, value in self.suiren_atom_gate_logits.items()
+            },
+            "graph": {
+                stream: float(torch.tanh(value).detach().cpu())
+                for stream, value in self.suiren_graph_gate_logits.items()
+            },
+        }
 
     def forward(self, batch: dict[str, torch.Tensor]) -> RFMEncoderInput:
         z = batch["z"].clamp(0, self.z_embedding.num_embeddings - 1)
@@ -432,6 +454,7 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
             self.suiren_feature_key(stream, "graph") in batch for stream in self.suiren_graph_state_projection
         )
         has_suiren = bool(has_suiren_atom or has_suiren_graph)
+        has_suiren_modality = has_suiren and self.include_suiren_modality_tokens
         suiren_atom_present = torch.full(
             (z.shape[0],), has_suiren_atom, dtype=torch.bool, device=z.device
         )
@@ -447,8 +470,8 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
             has_partial_Delta_BO=spec.has_partial_delta_bo,
             has_R_3D=spec.has_r_3d,
             has_P_3D=spec.has_p_3d,
-            has_Suiren_R=has_suiren,
-            has_Suiren_P=has_suiren,
+            has_Suiren_R=has_suiren_modality,
+            has_Suiren_P=has_suiren_modality,
         )
         context_token = self.task_embedding.unsqueeze(0) + self.modality_token(modality)
         context_minus = torch.zeros_like(context_token)
@@ -509,6 +532,8 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
                 "suiren_layout": ("h_R", "h_P", "Delta_h", "abs_Delta_h"),
                 "suiren_pair_tokens": False,
                 "suiren_input_gates": self.enable_suiren_gates,
+                "suiren_input_gate_init": self.suiren_gate_init,
+                "suiren_modality_tokens": self.include_suiren_modality_tokens,
             },
         )
         out.validate()

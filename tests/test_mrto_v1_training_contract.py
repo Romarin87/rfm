@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 
+from rfm.features.mrto_full import MRTOFullReactionInputAdapter
 from rfm.features.mrto_v1 import MRTOv1ReactionEncoder, MRTOv1ReactionInputAdapter
 from rfm.models.task_models import (
     MaskedEditPretrainingModel,
@@ -105,6 +106,63 @@ def masked_batch() -> dict[str, torch.Tensor]:
 
 
 class MRTOv1TrainingContractTest(unittest.TestCase):
+    def test_mrto_full_single_location_suiren_injection_contract(self) -> None:
+        torch.manual_seed(17)
+        batch = property_batch()
+        add_suiren_features(batch)
+        batch.pop("suiren_3d_graph_features")
+        perturbed = {key: value.clone() for key, value in batch.items()}
+        perturbed["suiren_3d_atom_features"] = torch.randn_like(
+            perturbed["suiren_3d_atom_features"]
+        )
+
+        initial_only = MRTOFullReactionInputAdapter(
+            hidden_dim=16,
+            pair_input_dim=2,
+            input_schema="property_rp2d_bo",
+            task_name="suiren_fusion_property",
+            endpoint_layers=1,
+            suiren_atom_dims={"3d": 16},
+            enable_suiren_gates=True,
+            suiren_gate_init=0.0,
+            suiren_injection_mode="initial_only",
+            dropout=0.0,
+        ).eval()
+        original_input = initial_only(batch)
+        perturbed_input = initial_only(perturbed)
+        torch.testing.assert_close(original_input.atom_tokens, perturbed_input.atom_tokens)
+        torch.testing.assert_close(original_input.reaction_token, perturbed_input.reaction_token)
+        self.assertFalse(bool(original_input.metadata["mrto_suiren_atom_present"].any()))
+        self.assertEqual(initial_only.suiren_input_gate_values(), {"atom": {"3d": 0.0}, "graph": {}})
+
+        probe = torch.randn_like(original_input.atom_tokens)
+        (original_input.atom_tokens * probe).sum().backward()
+        gate_grad = initial_only.suiren_atom_gate_logits["3d"].grad
+        self.assertIsNotNone(gate_grad)
+        self.assertGreater(float(gate_grad.abs()), 0.0)
+
+        conditioner_only = MRTOFullReactionInputAdapter(
+            hidden_dim=16,
+            pair_input_dim=2,
+            input_schema="property_rp2d_bo",
+            task_name="suiren_fusion_property",
+            endpoint_layers=1,
+            suiren_atom_dims={"3d": 16},
+            suiren_injection_mode="conditioner_only",
+            dropout=0.0,
+        ).eval()
+        original_input = conditioner_only(batch)
+        perturbed_input = conditioner_only(perturbed)
+        torch.testing.assert_close(original_input.atom_tokens, perturbed_input.atom_tokens)
+        torch.testing.assert_close(original_input.reaction_token, perturbed_input.reaction_token)
+        self.assertTrue(bool(original_input.metadata["mrto_suiren_atom_present"].all()))
+        self.assertFalse(
+            torch.allclose(
+                original_input.metadata["mrto_suiren_atom_plus"],
+                perturbed_input.metadata["mrto_suiren_atom_plus"],
+            )
+        )
+
     def _assert_parity(self, geometry: bool) -> None:
         schema = "property_irc_rp_bo" if geometry else "property_rp2d_bo"
         pair_dim = 4 if geometry else 2

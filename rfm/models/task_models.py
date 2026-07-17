@@ -716,6 +716,8 @@ class SuirenFusionPropertyRegressor(nn.Module):
         suiren_atom_dims: dict[str, int] | None = None,
         suiren_graph_dims: dict[str, int] | None = None,
         enable_suiren_input_gates: bool = False,
+        suiren_input_gate_init: float = 0.0,
+        suiren_injection_mode: str = "both",
         dynamic_pair_update: bool = False,
         dynamic_pair_update_scale: float = 1.0,
         dynamic_pair_update_dropout: float | None = None,
@@ -786,6 +788,8 @@ class SuirenFusionPropertyRegressor(nn.Module):
                 suiren_atom_dims=suiren_atom_dims,
                 suiren_graph_dims=suiren_graph_dims,
                 enable_suiren_gates=enable_suiren_input_gates,
+                suiren_gate_init=suiren_input_gate_init,
+                **({"suiren_injection_mode": suiren_injection_mode} if encoder_type == "mrto_full" else {}),
                 **adapter_kwargs,
             )
             masked_adapter_kwargs = dict(adapter_kwargs)
@@ -973,6 +977,10 @@ class SuirenFusionPropertyRegressor(nn.Module):
     def suiren_prior_gate_values(self) -> list[dict[str, float | int]]:
         values = getattr(self.encoder, "suiren_prior_gate_values", None)
         return values() if values is not None else []
+
+    def suiren_input_gate_values(self) -> dict[str, dict[str, float]]:
+        values = getattr(self.input_adapter, "suiren_input_gate_values", None)
+        return values() if values is not None else {}
 
     def _masked_forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         encoded = self.encoder(self.masked_adapter(self._masked_batch(batch)))
