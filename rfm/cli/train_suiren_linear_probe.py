@@ -32,7 +32,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=suiren_linear_probe.REPRESENTATIONS,
         default="state_abs_delta",
     )
-    parser.add_argument("--ridge-alphas", default="1e-6,1e-5,1e-4,1e-3,1e-2,1e-1,1")
+    parser.add_argument("--ridge-alphas", default="1e-8,1e-7,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1,1")
     parser.add_argument("--pool-chunk-reactions", type=int, default=2048)
     parser.add_argument("--overwrite-pooled-cache", action="store_true")
     parser.add_argument("--device", default="cuda")
