@@ -38,7 +38,7 @@ class SuirenResidualProbeDataset(Dataset):
         )
         if self.atom_store.path is None:
             raise ValueError("a Suiren 3D atom cache is required")
-        if len(self.atom_store) != len(self.samples):
+        if len(self.atom_store) < len(self.samples) or (not limit and len(self.atom_store) != len(self.samples)):
             raise ValueError(
                 f"Suiren atom cache/sample length mismatch: cache={len(self.atom_store)} samples={len(self.samples)}"
             )
