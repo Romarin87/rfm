@@ -7,6 +7,7 @@ from .task_models import (
     SuirenFusionPropertyRegressor,
     load_pretrained_encoder,
     load_stage_a_checkpoint,
+    load_stage_b_checkpoint,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "SuirenFusionPropertyRegressor",
     "load_pretrained_encoder",
     "load_stage_a_checkpoint",
+    "load_stage_b_checkpoint",
 ]

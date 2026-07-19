@@ -17,7 +17,12 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from rfm.data.sampling import AtomCountBatchSampler
-from rfm.models import ReactionPropertyRegressor, load_pretrained_encoder, load_stage_a_checkpoint
+from rfm.models import (
+    ReactionPropertyRegressor,
+    load_pretrained_encoder,
+    load_stage_a_checkpoint,
+    load_stage_b_checkpoint,
+)
 from rfm.optim import build_optimizer
 from rfm.tasks import reaction_property
 from rfm.utils.runtime import (
@@ -42,6 +47,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--run-id", default="")
     parser.add_argument("--pretrained-stage-a", default="")
+    parser.add_argument("--pretrained-stage-b", default="")
     parser.add_argument("--pretrained-encoder", default="")
     parser.add_argument("--freeze-encoder", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
@@ -203,9 +209,15 @@ def main(argv: list[str] | None = None) -> None:
         mrto_equiformer_max_neighbors=args.mrto_equiformer_max_neighbors,
         joint_encoder_pass=args.joint_encoder_pass,
     ).to(device)
-    if args.pretrained_stage_a and args.pretrained_encoder:
-        raise ValueError("use either --pretrained-stage-a or --pretrained-encoder, not both")
-    if args.pretrained_stage_a:
+    preload_count = sum(
+        bool(path)
+        for path in (args.pretrained_stage_a, args.pretrained_stage_b, args.pretrained_encoder)
+    )
+    if preload_count > 1:
+        raise ValueError("use only one of --pretrained-stage-a, --pretrained-stage-b, or --pretrained-encoder")
+    if args.pretrained_stage_b:
+        load_stage_b_checkpoint(model, args.pretrained_stage_b, device)
+    elif args.pretrained_stage_a:
         load_stage_a_checkpoint(model, args.pretrained_stage_a, device)
     elif args.pretrained_encoder:
         if args.encoder_type in {"radar", "mrto", "mrto_v1", "mrto_full"}:
@@ -300,6 +312,7 @@ def main(argv: list[str] | None = None) -> None:
             "seed": args.seed,
             "world_size": world,
             "pretrained_stage_a": args.pretrained_stage_a,
+            "pretrained_stage_b": args.pretrained_stage_b,
             "pretrained_encoder": args.pretrained_encoder,
             "freeze_encoder": args.freeze_encoder,
             "input_schema": input_schema,
@@ -416,7 +429,7 @@ def main(argv: list[str] | None = None) -> None:
             status="complete",
             notes=(
                 f"input_schema={input_schema}; geometry_mode={args.geometry_mode}; encoder_type={args.encoder_type}; "
-                f"stage_a_checkpoint={args.pretrained_stage_a or args.pretrained_encoder}; "
+                f"initial_checkpoint={args.pretrained_stage_b or args.pretrained_stage_a or args.pretrained_encoder}; "
                 f"loss=0.5*L_A+1.0*L_B; selection=minimum valid_loss; optimizer={args.optimizer}"
             ),
         )

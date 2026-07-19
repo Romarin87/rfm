@@ -146,15 +146,26 @@ class MRTOFullReactionInputAdapter(MRTOv1ReactionInputAdapter):
         suiren_injection_mode: str = "both",
         **kwargs,
     ):
-        if suiren_injection_mode not in {"both", "initial_only", "conditioner_only"}:
+        if suiren_injection_mode not in {
+            "both",
+            "initial_only",
+            "conditioner_only",
+            "parity_initial_only",
+        }:
             raise ValueError(
                 "suiren_injection_mode must be one of "
-                f"('both', 'initial_only', 'conditioner_only'), got {suiren_injection_mode!r}"
+                "('both', 'initial_only', 'conditioner_only', 'parity_initial_only'), "
+                f"got {suiren_injection_mode!r}"
             )
         self.suiren_injection_mode = suiren_injection_mode
         kwargs["enable_distance_geometry"] = False
-        kwargs["inject_suiren_initial"] = suiren_injection_mode in {"both", "initial_only"}
+        kwargs["inject_suiren_initial"] = suiren_injection_mode in {
+            "both",
+            "initial_only",
+            "parity_initial_only",
+        }
         kwargs["include_suiren_modality_tokens"] = suiren_injection_mode == "both"
+        kwargs["parity_aligned_suiren_atom"] = suiren_injection_mode == "parity_initial_only"
         super().__init__(*args, **kwargs)
         has_geometry = self.featurizer.spec.has_r_3d or self.featurizer.spec.has_p_3d
         if equiformer_adapter is not None and not has_geometry:
@@ -176,7 +187,7 @@ class MRTOFullReactionInputAdapter(MRTOv1ReactionInputAdapter):
         encoder_input = super().forward(batch)
         encoder_input.metadata["encoder_family"] = "mrto_full"
         encoder_input.metadata["suiren_injection_mode"] = self.suiren_injection_mode
-        if self.suiren_injection_mode == "initial_only":
+        if self.suiren_injection_mode in {"initial_only", "parity_initial_only"}:
             encoder_input.metadata["mrto_suiren_atom_present"] = torch.zeros_like(
                 encoder_input.metadata["mrto_suiren_atom_present"]
             )

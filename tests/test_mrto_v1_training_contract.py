@@ -13,6 +13,7 @@ from rfm.models.task_models import (
     ReactionPropertyRegressor,
     SuirenFusionPropertyRegressor,
     load_stage_a_checkpoint,
+    load_stage_b_checkpoint,
 )
 
 
@@ -106,6 +107,116 @@ def masked_batch() -> dict[str, torch.Tensor]:
 
 
 class MRTOv1TrainingContractTest(unittest.TestCase):
+    def test_parity_aligned_suiren_atom_input_is_single_location_and_swap_equivariant(self) -> None:
+        torch.manual_seed(31)
+        batch = property_batch()
+        add_suiren_features(batch)
+        batch.pop("suiren_3d_graph_features")
+        adapter = MRTOFullReactionInputAdapter(
+            hidden_dim=16,
+            pair_input_dim=2,
+            input_schema="property_rp2d_bo",
+            task_name="suiren_fusion_property",
+            endpoint_layers=1,
+            suiren_atom_dims={"3d": 16},
+            enable_suiren_gates=True,
+            suiren_gate_init=0.0,
+            suiren_injection_mode="parity_initial_only",
+            dropout=0.0,
+        ).eval()
+        with torch.no_grad():
+            gate_logit = torch.atanh(torch.tensor(0.4))
+            adapter.suiren_atom_parity_even_gate_logits["3d"].copy_(gate_logit)
+            adapter.suiren_atom_parity_odd_gate_logits["3d"].copy_(gate_logit)
+
+        forward = adapter(batch)
+        reverse = adapter(reverse_property_batch(batch))
+        torch.testing.assert_close(
+            forward.metadata["mrto_atom_fields"]["a_plus"],
+            reverse.metadata["mrto_atom_fields"]["a_plus"],
+        )
+        torch.testing.assert_close(
+            forward.metadata["mrto_atom_fields"]["a_minus"],
+            -reverse.metadata["mrto_atom_fields"]["a_minus"],
+        )
+        self.assertFalse(bool(forward.metadata["mrto_suiren_atom_present"].any()))
+        self.assertFalse(forward.metadata["suiren_cached_derived_blocks_used"])
+
+        changed_derived = {key: value.clone() for key, value in batch.items()}
+        state_dim = changed_derived["suiren_3d_atom_features"].shape[-1] // 4
+        changed_derived["suiren_3d_atom_features"][..., 2 * state_dim :] = torch.randn_like(
+            changed_derived["suiren_3d_atom_features"][..., 2 * state_dim :]
+        )
+        changed = adapter(changed_derived)
+        torch.testing.assert_close(forward.atom_tokens, changed.atom_tokens)
+        torch.testing.assert_close(forward.reaction_token, changed.reaction_token)
+
+    def test_stage_b_checkpoint_zero_gate_exactly_matches_parity_suiren_model(self) -> None:
+        torch.manual_seed(37)
+        common = {
+            "encoder_type": "mrto_full",
+            "mrto_attention_heads": 4,
+            "mrto_event_slots": 4,
+            "mrto_event_topk": 4,
+            "mrto_endpoint_layers": 1,
+            "mrto_triangle_layers": 1,
+            "mrto_triangle_dim": 8,
+        }
+        stage_b = ReactionPropertyRegressor(
+            2,
+            16,
+            1,
+            0.0,
+            "property_rp2d_bo",
+            **common,
+        ).eval()
+        stage_c = SuirenFusionPropertyRegressor(
+            2,
+            16,
+            1,
+            0.0,
+            "property_rp2d_bo",
+            suiren_atom_dims={"3d": 16},
+            enable_suiren_input_gates=True,
+            suiren_input_gate_init=0.0,
+            suiren_injection_mode="parity_initial_only",
+            **common,
+        ).eval()
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "model.pt"
+            torch.save(
+                {
+                    "model": stage_b.state_dict(),
+                    "config": {"encoder_type": "mrto_full"},
+                    "model_class": "ReactionPropertyRegressor",
+                },
+                checkpoint,
+            )
+            restored = load_stage_b_checkpoint(stage_c, str(checkpoint), torch.device("cpu"))
+        self.assertEqual(restored, checkpoint)
+        self.assertEqual(
+            stage_c.suiren_input_gate_values(),
+            {"atom_plus": {"3d": 0.0}, "atom_minus": {"3d": 0.0}, "graph": {}},
+        )
+
+        batch = property_batch()
+        add_suiren_features(batch)
+        batch.pop("suiren_3d_graph_features")
+        with torch.no_grad():
+            expected = stage_b(batch)
+            actual = stage_c(batch)
+        torch.testing.assert_close(expected["y"], actual["y"], atol=0.0, rtol=0.0)
+        torch.testing.assert_close(expected["reaction_h"], actual["reaction_h"], atol=0.0, rtol=0.0)
+
+        stage_c.zero_grad(set_to_none=True)
+        stage_c(batch)["y"].square().sum().backward()
+        for gates in (
+            stage_c.input_adapter.suiren_atom_parity_even_gate_logits,
+            stage_c.input_adapter.suiren_atom_parity_odd_gate_logits,
+        ):
+            self.assertIsNotNone(gates["3d"].grad)
+            self.assertGreater(float(gates["3d"].grad.abs()), 0.0)
+
     def test_mrto_full_single_location_suiren_injection_contract(self) -> None:
         torch.manual_seed(17)
         batch = property_batch()

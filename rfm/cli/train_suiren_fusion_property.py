@@ -17,7 +17,12 @@ from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
 from rfm.data.sampling import AtomCountBatchSampler
-from rfm.models import SuirenFusionPropertyRegressor, load_pretrained_encoder, load_stage_a_checkpoint
+from rfm.models import (
+    SuirenFusionPropertyRegressor,
+    load_pretrained_encoder,
+    load_stage_a_checkpoint,
+    load_stage_b_checkpoint,
+)
 from rfm.optim import build_optimizer
 from rfm.tasks import suiren_fusion_property
 from rfm.utils.runtime import (
@@ -46,6 +51,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--run-id", default="")
     parser.add_argument("--pretrained-stage-a", default="")
+    parser.add_argument("--pretrained-stage-b", default="")
     parser.add_argument("--pretrained-encoder", default="")
     parser.add_argument("--freeze-encoder", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
@@ -108,7 +114,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--suiren-input-gate-init", type=float, default=0.0)
     parser.add_argument(
         "--suiren-injection-mode",
-        choices=("both", "initial_only", "conditioner_only"),
+        choices=("both", "initial_only", "conditioner_only", "parity_initial_only"),
         default="both",
     )
     parser.add_argument("--enable-dynamic-pair-update", action="store_true")
@@ -262,8 +268,11 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if args.suiren_injection_mode != "both" and args.encoder_type != "mrto_full":
         raise ValueError("single-location Suiren injection modes require --encoder-type mrto_full")
-    if args.suiren_injection_mode == "initial_only" and not args.enable_suiren_input_gates:
-        raise ValueError("initial_only requires --enable-suiren-input-gates for an explicit learnable gate")
+    if (
+        args.suiren_injection_mode in {"initial_only", "parity_initial_only"}
+        and not args.enable_suiren_input_gates
+    ):
+        raise ValueError(f"{args.suiren_injection_mode} requires --enable-suiren-input-gates")
     if args.suiren_injection_mode == "conditioner_only" and args.enable_suiren_input_gates:
         raise ValueError("conditioner_only must not enable the separate input gate")
     if args.encoder_type == "mrto_full" and args.mrto_event_topk == 0:
@@ -296,6 +305,11 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("Suiren graph feature dimensions differ across splits")
     if train_ds.suiren_atom_dims != valid_ds.suiren_atom_dims or train_ds.suiren_atom_dims != test_ds.suiren_atom_dims:
         raise ValueError("Suiren atom feature dimensions differ across splits")
+    if args.suiren_injection_mode == "parity_initial_only":
+        if train_ds.suiren_graph_dims:
+            raise ValueError("parity_initial_only accepts atom caches only")
+        if not train_ds.suiren_atom_dims:
+            raise ValueError("parity_initial_only requires at least one atom cache")
 
     if args.train_batching == "atom_count_bucket" and args.forward_reverse_consistency_weight > 0.0:
         raise ValueError("atom-count bucketing is incompatible with adjacent forward/reverse consistency batches")
@@ -395,9 +409,15 @@ def main(argv: list[str] | None = None) -> None:
         mrto_equiformer_max_neighbors=args.mrto_equiformer_max_neighbors,
         joint_encoder_pass=args.joint_encoder_pass,
     ).to(device)
-    if args.pretrained_stage_a and args.pretrained_encoder:
-        raise ValueError("use either --pretrained-stage-a or --pretrained-encoder, not both")
-    if args.pretrained_stage_a:
+    preload_count = sum(
+        bool(path)
+        for path in (args.pretrained_stage_a, args.pretrained_stage_b, args.pretrained_encoder)
+    )
+    if preload_count > 1:
+        raise ValueError("use only one of --pretrained-stage-a, --pretrained-stage-b, or --pretrained-encoder")
+    if args.pretrained_stage_b:
+        load_stage_b_checkpoint(model, args.pretrained_stage_b, device)
+    elif args.pretrained_stage_a:
         load_stage_a_checkpoint(model, args.pretrained_stage_a, device)
     elif args.pretrained_encoder:
         if args.encoder_type in {"radar", "mrto_v1", "mrto_full"}:
@@ -483,6 +503,7 @@ def main(argv: list[str] | None = None) -> None:
             "seed": args.seed,
             "world_size": world,
             "pretrained_stage_a": args.pretrained_stage_a,
+            "pretrained_stage_b": args.pretrained_stage_b,
             "pretrained_encoder": args.pretrained_encoder,
             "freeze_encoder": args.freeze_encoder,
             "input_schema": input_schema,
@@ -598,9 +619,11 @@ def main(argv: list[str] | None = None) -> None:
                     "edit_set_weight": args.mrto_edit_set_weight,
                 },
                 "suiren_input_semantics": {
-                    "graph_features": "per-block event-slot conditioning for mrto_full",
-                    "atom_features": "per-block atom-field AdaLN/FiLM conditioning for mrto_full",
-                    "mrto_parity": "R/P shared state projection with even abs-delta and odd signed-delta fields",
+                    "injection_mode": args.suiren_injection_mode,
+                    "graph_features": "disabled in parity_initial_only; legacy modes retain their declared behavior",
+                    "atom_features": "parity_initial_only derives even/odd fields from h_R/h_P and injects them once",
+                    "mrto_parity": "even=(h_R+h_P)/2; odd=(h_P-h_R)/2",
+                    "cached_derived_blocks_used": args.suiren_injection_mode != "parity_initial_only",
                     "suiren_pair_tokens": False,
                     "encoder_output_shape_fixed": True,
                 },
@@ -677,7 +700,7 @@ def main(argv: list[str] | None = None) -> None:
             notes=(
                 f"input_schema={input_schema}; geometry_mode={args.geometry_mode}; suiren=unified_input; "
                 f"encoder_type={args.encoder_type}; "
-                f"stage_a_checkpoint={args.pretrained_stage_a or args.pretrained_encoder}; "
+                f"initial_checkpoint={args.pretrained_stage_b or args.pretrained_stage_a or args.pretrained_encoder}; "
                 f"loss=0.5*L_A+1.0*L_C+{args.forward_reverse_consistency_weight}*L_FR; "
                 f"selection=minimum valid_loss; optimizer={args.optimizer}; suiren_dims={cache_info['dims']}; "
                 f"switches=gates:{args.enable_suiren_input_gates},input_gate_init:{args.suiren_input_gate_init},"

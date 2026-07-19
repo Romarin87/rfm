@@ -175,6 +175,7 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
         suiren_gate_init: float = 0.0,
         inject_suiren_initial: bool = True,
         include_suiren_modality_tokens: bool = True,
+        parity_aligned_suiren_atom: bool = False,
     ):
         super().__init__(hidden_dim, task_name=task_name)
         schema = input_schema or infer_pair_basis_schema(
@@ -191,6 +192,7 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
         self.suiren_gate_init = float(suiren_gate_init)
         self.inject_suiren_initial = bool(inject_suiren_initial)
         self.include_suiren_modality_tokens = bool(include_suiren_modality_tokens)
+        self.parity_aligned_suiren_atom = bool(parity_aligned_suiren_atom)
         self.suiren_atom_dims = dict(suiren_atom_dims or {})
         self.suiren_graph_dims = dict(suiren_graph_dims or {})
         if suiren_atom_dim > 0 and not self.suiren_atom_dims:
@@ -204,6 +206,10 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
                 "MRTO-v1 Suiren features require [h_R,h_P,Delta_h,abs_Delta_h] "
                 f"with four equal-width blocks, atom={invalid_atom_dims}, graph={invalid_graph_dims}"
             )
+        if self.parity_aligned_suiren_atom and self.suiren_graph_dims:
+            raise ValueError("parity-aligned Suiren v1 accepts atom features only")
+        if self.parity_aligned_suiren_atom and not self.enable_suiren_gates:
+            raise ValueError("parity-aligned Suiren v1 requires explicit learnable input gates")
         self.suiren_atom_state_dims = {name: dim // 4 for name, dim in self.suiren_atom_dims.items()}
         self.suiren_graph_state_dims = {name: dim // 4 for name, dim in self.suiren_graph_dims.items()}
         self.z_embedding = nn.Embedding(max_z + 1, hidden_dim)
@@ -226,22 +232,38 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
         self.odd_pair_projection = OddMLP(4, hidden_dim, dropout)
         self.even_atom_projection = _feature_projection(5, hidden_dim, dropout)
         self.odd_atom_projection = OddMLP(4, hidden_dim, dropout)
+        legacy_atom_state_dims = {} if self.parity_aligned_suiren_atom else self.suiren_atom_state_dims
         self.suiren_atom_state_projection = nn.ModuleDict(
             {
                 name: _feature_projection(dim, hidden_dim, dropout)
-                for name, dim in sorted(self.suiren_atom_state_dims.items())
+                for name, dim in sorted(legacy_atom_state_dims.items())
             }
         )
         self.suiren_atom_abs_delta_projection = nn.ModuleDict(
             {
                 name: _feature_projection(dim, hidden_dim, dropout)
-                for name, dim in sorted(self.suiren_atom_state_dims.items())
+                for name, dim in sorted(legacy_atom_state_dims.items())
             }
         )
         self.suiren_atom_delta_projection = nn.ModuleDict(
             {
                 name: OddMLP(dim, hidden_dim, dropout)
-                for name, dim in sorted(self.suiren_atom_state_dims.items())
+                for name, dim in sorted(legacy_atom_state_dims.items())
+            }
+        )
+        parity_atom_state_dims = (
+            self.suiren_atom_state_dims if self.parity_aligned_suiren_atom else {}
+        )
+        self.suiren_atom_parity_even_projection = nn.ModuleDict(
+            {
+                name: _even_mlp(dim, hidden_dim, dropout)
+                for name, dim in sorted(parity_atom_state_dims.items())
+            }
+        )
+        self.suiren_atom_parity_odd_projection = nn.ModuleDict(
+            {
+                name: OddMLP(dim, hidden_dim, dropout)
+                for name, dim in sorted(parity_atom_state_dims.items())
             }
         )
         self.suiren_graph_state_projection = nn.ModuleDict(
@@ -269,6 +291,18 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
         self.suiren_graph_gate_logits = nn.ParameterDict(
             {name: nn.Parameter(torch.tensor(raw_gate_init)) for name in self.suiren_graph_state_projection}
         )
+        self.suiren_atom_parity_even_gate_logits = nn.ParameterDict(
+            {
+                name: nn.Parameter(torch.tensor(raw_gate_init))
+                for name in self.suiren_atom_parity_even_projection
+            }
+        )
+        self.suiren_atom_parity_odd_gate_logits = nn.ParameterDict(
+            {
+                name: nn.Parameter(torch.tensor(raw_gate_init))
+                for name in self.suiren_atom_parity_odd_projection
+            }
+        )
 
     @staticmethod
     def suiren_feature_key(stream: str, level: str) -> str:
@@ -285,6 +319,18 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
     def suiren_input_gate_values(self) -> dict[str, dict[str, float]]:
         if not self.enable_suiren_gates:
             return {}
+        if self.parity_aligned_suiren_atom:
+            return {
+                "atom_plus": {
+                    stream: float(torch.tanh(value).detach().cpu())
+                    for stream, value in self.suiren_atom_parity_even_gate_logits.items()
+                },
+                "atom_minus": {
+                    stream: float(torch.tanh(value).detach().cpu())
+                    for stream, value in self.suiren_atom_parity_odd_gate_logits.items()
+                },
+                "graph": {},
+            }
         return {
             "atom": {
                 stream: float(torch.tanh(value).detach().cpu())
@@ -387,6 +433,24 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
         suiren_atom_prior_even = torch.zeros_like(atom_r)
         suiren_atom_prior_odd = torch.zeros_like(atom_r)
         has_suiren_atom = False
+        for stream, even_projection in self.suiren_atom_parity_even_projection.items():
+            key = self.suiren_feature_key(stream, "atom")
+            if key not in batch:
+                continue
+            feature = batch[key]
+            state_dim = self.suiren_atom_state_dims[stream]
+            if feature.shape[:2] != atom_r.shape[:2] or feature.shape[-1] != state_dim * 4:
+                raise ValueError(f"{key} must be [B,N,{state_dim * 4}], got {tuple(feature.shape)}")
+            h_r, h_p, _, _ = feature.split(state_dim, dim=-1)
+            s_even = 0.5 * (h_r + h_p)
+            s_odd = 0.5 * (h_p - h_r)
+            even_gate = torch.tanh(self.suiren_atom_parity_even_gate_logits[stream])
+            odd_gate = torch.tanh(self.suiren_atom_parity_odd_gate_logits[stream])
+            suiren_atom_even = suiren_atom_even + even_gate * even_projection(s_even)
+            suiren_atom_odd = suiren_atom_odd + odd_gate * (
+                self.suiren_atom_parity_odd_projection[stream](s_odd)
+            )
+            has_suiren_atom = True
         for stream, projection in self.suiren_atom_state_projection.items():
             key = self.suiren_feature_key(stream, "atom")
             if key not in batch:
@@ -534,6 +598,8 @@ class MRTOv1ReactionInputAdapter(BaseRFMAdapter):
                 "suiren_input_gates": self.enable_suiren_gates,
                 "suiren_input_gate_init": self.suiren_gate_init,
                 "suiren_modality_tokens": self.include_suiren_modality_tokens,
+                "suiren_parity_aligned_atom": self.parity_aligned_suiren_atom,
+                "suiren_cached_derived_blocks_used": not self.parity_aligned_suiren_atom,
             },
         )
         out.validate()

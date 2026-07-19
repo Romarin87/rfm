@@ -1061,3 +1061,52 @@ def load_stage_a_checkpoint(model: nn.Module, path: str, device: torch.device) -
     model.masked_adapter.load_state_dict(component("adapter"), strict=True)
     model.masked_edit_heads.load_state_dict(component("masked_edit_heads"), strict=True)
     return checkpoint
+
+
+def load_stage_b_checkpoint(model: nn.Module, path: str, device: torch.device) -> Path:
+    """Restore a complete property model, leaving only new Suiren input weights initialized."""
+
+    checkpoint = Path(path)
+    if checkpoint.is_dir():
+        checkpoint = checkpoint / "model.pt"
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Stage B checkpoint not found: {checkpoint}")
+
+    payload = torch.load(checkpoint, map_location=device, weights_only=False)
+    if not isinstance(payload, dict) or not isinstance(payload.get("model"), dict):
+        raise ValueError(f"Stage B checkpoint must contain a full model state: {checkpoint}")
+    source_state = payload["model"]
+    source_encoder_type = payload.get("config", {}).get("encoder_type")
+    target_encoder_type = getattr(model, "encoder_type", None)
+    if source_encoder_type and target_encoder_type and source_encoder_type != target_encoder_type:
+        raise ValueError(
+            f"Stage B encoder_type mismatch: source={source_encoder_type} target={target_encoder_type}"
+        )
+
+    target_adapter_prefix = "input_adapter" if hasattr(model, "input_adapter") else "adapter"
+    mapped_state: dict[str, torch.Tensor] = {}
+    for key, value in source_state.items():
+        if key.startswith("adapter."):
+            key = f"{target_adapter_prefix}.{key[len('adapter.') :]}"
+        mapped_state[key] = value
+
+    target_state = model.state_dict()
+    shape_mismatches = {
+        key: (tuple(mapped_state[key].shape), tuple(target_state[key].shape))
+        for key in mapped_state.keys() & target_state.keys()
+        if mapped_state[key].shape != target_state[key].shape
+    }
+    if shape_mismatches:
+        raise RuntimeError(f"Stage B checkpoint shape mismatch: {shape_mismatches}")
+
+    restored_state = {key: value for key, value in mapped_state.items() if key in target_state}
+    missing, unexpected = model.load_state_dict(restored_state, strict=False)
+    allowed_missing_prefix = f"{target_adapter_prefix}.suiren_"
+    bad_missing = [key for key in missing if not key.startswith(allowed_missing_prefix)]
+    source_only = [key for key in mapped_state if key not in target_state]
+    if bad_missing or unexpected or source_only:
+        raise RuntimeError(
+            "Stage B checkpoint load mismatch: "
+            f"missing={bad_missing[:10]} unexpected={unexpected[:10]} source_only={source_only[:10]}"
+        )
+    return checkpoint
