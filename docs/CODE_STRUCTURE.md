@@ -105,6 +105,12 @@ Suiren cache 训练/评估前必须验证 `failed.sum() == 0`；failed row 不�
 Reaction Encoder 输出接口固定为 `atom_h: [B,N,H]`、`pair_h: [B,N,N,H]`、
 `reaction_h: [B,H]`；property head / masked-edit heads 不随 Suiren feature 组合改变输入维度。
 
+从 Stage B checkpoint 启动 Stage C 时采用 discriminative fine-tuning：新增 Suiren input
+projection/gate（以及启用的 block 内 Suiren conditioner）使用 `--lr`，Stage B 继承参数使用
+`--stage-b-lr-scale * --lr`，默认分别为 `2e-4` 和 `2e-5`。训练前的加载状态作为
+`epoch=-1` 参与 validation loss checkpoint selection，避免继续训练破坏已收敛 Stage B 后仍
+强制选择退化 checkpoint；可用 `--no-select-initial-checkpoint` 关闭该行为。
+
 完整 MRTO 实现见 `docs/MRTO_FULL_ARCHITECTURE.md`。`mrto_full` 使用一套共享的
 EquiformerV2 endpoint adapter 处理 R/P 独立坐标系，在主干内保持严格 R/P swap
 even/odd fields，并通过 competitive sparse event slots 读写 atom/pair fields。Stage C
