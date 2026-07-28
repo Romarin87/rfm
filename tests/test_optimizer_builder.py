@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
+from rfm.cli.train_reaction_property import stage_b_parameter_group
 from rfm.cli.train_suiren_fusion_property import stage_c_parameter_group
 from rfm.optim import build_optimizer
 
@@ -64,6 +65,17 @@ class OptimizerBuilderTest(unittest.TestCase):
         )
         self.assertEqual(
             stage_c_parameter_group("module.reg_head.weight", parameter, 0.1),
+            ("stage_b_inherited", 0.1),
+        )
+
+    def test_stage_b_parameter_group_scales_all_parameters(self) -> None:
+        parameter = nn.Parameter(torch.ones(1))
+        self.assertEqual(
+            stage_b_parameter_group("module.encoder.layers.0.weight", parameter, 0.1),
+            ("stage_b_inherited", 0.1),
+        )
+        self.assertEqual(
+            stage_b_parameter_group("module.reg_head.weight", parameter, 0.1),
             ("stage_b_inherited", 0.1),
         )
 

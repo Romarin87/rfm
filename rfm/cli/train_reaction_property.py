@@ -60,6 +60,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-every-steps", type=int, default=0)
     parser.add_argument("--joint-encoder-pass", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument(
+        "--stage-b-lr-scale",
+        type=float,
+        default=0.1,
+        help="LR multiplier for parameters inherited from --pretrained-stage-b.",
+    )
+    parser.add_argument(
+        "--select-initial-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow the loaded Stage B state before continuation training to win validation checkpoint selection.",
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=3)
@@ -127,10 +139,29 @@ def reaction_property_schema(args: argparse.Namespace) -> tuple[str, int]:
     return "property_rp2d_bo", 2
 
 
+def stage_b_parameter_group(
+    _name: str,
+    _parameter: torch.nn.Parameter,
+    inherited_lr_scale: float,
+) -> tuple[str, float]:
+    """Apply the continuation LR to every parameter restored from Stage B."""
+
+    return "stage_b_inherited", inherited_lr_scale
+
+
+def snapshot_model_state(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if args.encoder_type == "mrto_full" and args.mrto_event_topk == 0:
         args.mrto_event_topk = 16
+    if args.stage_b_lr_scale <= 0.0:
+        raise ValueError(f"--stage-b-lr-scale must be positive, got {args.stage_b_lr_scale}")
     rank, world, local_rank = setup_ddp()
     set_seed(args.seed + rank)
     device = resolve_device(args.device, local_rank)
@@ -227,7 +258,18 @@ def main(argv: list[str] | None = None) -> None:
         for param in model.encoder.parameters():
             param.requires_grad = False
     train_model: nn.Module = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=args.freeze_encoder) if ddp_enabled() and device.type == "cuda" else model
-    optimizer = build_optimizer(train_model.named_parameters(), args)
+    parameter_group_resolver = None
+    if args.pretrained_stage_b:
+        parameter_group_resolver = lambda name, parameter: stage_b_parameter_group(
+            name,
+            parameter,
+            args.stage_b_lr_scale,
+        )
+    optimizer = build_optimizer(
+        train_model.named_parameters(),
+        args,
+        parameter_group_resolver=parameter_group_resolver,
+    )
 
     history: list[dict[str, Any]] = []
     best_valid_loss = float("inf")
@@ -237,6 +279,39 @@ def main(argv: list[str] | None = None) -> None:
     no_improve_epochs = 0
     early_stopped = False
     stop_epoch = args.epochs - 1
+    select_initial_checkpoint = bool(args.pretrained_stage_b and args.select_initial_checkpoint)
+
+    if is_main(rank) and select_initial_checkpoint:
+        initial_valid_loss = reaction_property.evaluate_loss(
+            model,
+            valid_loader,
+            y_mean,
+            y_std,
+            args,
+            device,
+        )
+        initial_valid_metrics = reaction_property.evaluate(
+            model,
+            valid_loader,
+            y_mean,
+            y_std,
+            device,
+        )
+        initial_row = {
+            "event": "initial_validation",
+            "epoch": -1,
+            "valid_loss": initial_valid_loss,
+            "valid": initial_valid_metrics,
+            "router_gates": model.masked_edit_heads.router_gate_values(),
+        }
+        history.append(initial_row)
+        print(json.dumps(initial_row, ensure_ascii=False), flush=True)
+        best_valid_loss = initial_valid_loss["loss"]
+        best_valid_loss_parts = initial_valid_loss
+        best_state = snapshot_model_state(model)
+        best_epoch = -1
+    if ddp_enabled():
+        dist.barrier()
 
     for epoch in range(args.epochs):
         if train_sampler is not None:
@@ -268,7 +343,7 @@ def main(argv: list[str] | None = None) -> None:
                 best_valid_loss = valid_loss["loss"]
                 best_valid_loss_parts = valid_loss
                 best_epoch = epoch
-                best_state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+                best_state = snapshot_model_state(model)
                 no_improve_epochs = 0
             else:
                 no_improve_epochs += 1
@@ -321,12 +396,18 @@ def main(argv: list[str] | None = None) -> None:
             "optimizer": args.optimizer,
             "optimizer_metadata": getattr(optimizer, "metadata", {"optimizer": args.optimizer}),
             "epochs_requested": args.epochs,
-            "epochs_completed": stop_epoch + 1 if early_stopped else len(history),
+            "epochs_completed": sum(int(row.get("epoch", -1) >= 0) for row in history),
             "early_stopped": early_stopped,
             "early_stop_patience": args.early_stop_patience,
             "early_stop_min_delta": args.early_stop_min_delta,
+            "initial_checkpoint_eligible": select_initial_checkpoint,
             "router_gates": model.masked_edit_heads.router_gate_values(),
-            "selection": {"criterion": "valid_loss", "best_valid_loss": best_valid_loss, "best_valid_loss_parts": best_valid_loss_parts},
+            "selection": {
+                "criterion": "valid_loss",
+                "initial_checkpoint_eligible": select_initial_checkpoint,
+                "best_valid_loss": best_valid_loss,
+                "best_valid_loss_parts": best_valid_loss_parts,
+            },
             "valid": valid_metrics,
             "test": test_metrics,
             "target_mean": y_mean.detach().cpu().numpy().tolist(),
